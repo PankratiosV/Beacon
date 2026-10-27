@@ -3,6 +3,7 @@
 Beacon watches [LightBurn](https://lightburnsoftware.com) and shows what your laser is doing —
 **Running, Paused, Framing, Ready or Disconnected** — in a small window or floating pill, on a
 USB or Wi-Fi **stack light**, and on your phone. It also times every job and keeps statistics.
+Beacon allows for integrating Arduino hardware into your laser workflows, allowing nearly unlimited ways to interact with your lasers. 
 
 Windows 10/11 (64-bit). Free for noncommercial use — see [License](#license).
 
