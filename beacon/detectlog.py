@@ -21,10 +21,15 @@ from datetime import datetime
 
 FLIP_SECONDS = 3.0        # A -> B -> A this fast is counted as a likely misread
 MAX_PICTURES = 400        # oldest pictures are deleted beyond this
+# _UNSET: "no status seen yet", different from None (which means "not found").
 _UNSET = object()
 
 
 def _blank():
+    """Fresh running totals. seconds_* split the time between readings into
+    LightBurn open and readable / open but unreadable / closed; by_raw and
+    by_mode count readings per raw status and per way of reading; changes,
+    flips, glitches, unreadable_spells and reports count events."""
     return {"since": time.time(), "reads": 0,
             "seconds_open": 0.0, "seconds_read": 0.0, "seconds_unreadable": 0.0,
             "seconds_closed": 0.0, "by_raw": {}, "by_mode": {}, "changes": 0,
@@ -33,6 +38,7 @@ def _blank():
 
 
 def _human(seconds):
+    """"45s", "12m", "2h 05m"."""
     seconds = int(seconds)
     if seconds < 60:
         return f"{seconds}s"
@@ -61,6 +67,8 @@ class DetectionLog:
 
     # ---------------------------------------------------------------- files
     def _load(self):
+        """The saved totals, or fresh ones. Unknown keys from other versions are
+        dropped and missing ones filled in."""
         try:
             with open(os.path.join(self.folder, "summary.json"), encoding="utf-8") as f:
                 s = json.load(f)
@@ -71,6 +79,7 @@ class DetectionLog:
             return _blank()
 
     def save(self):
+        """Write the totals to summary.json (also done once a minute by record)."""
         self._saved_at = time.time()
         try:
             os.makedirs(self.folder, exist_ok=True)
@@ -80,6 +89,9 @@ class DetectionLog:
             pass
 
     def _event(self, kind, msg, now, crop=None, **extra):
+        """Append one event line to events.jsonl: the time, the event kind, what
+        was shown and read, how, the note, the first lines of text read, any
+        extra fields, and the name of its picture if one is saved."""
         e = {"time": datetime.fromtimestamp(now).isoformat(timespec="milliseconds"),
              "event": kind, "shown": msg.get("shown"), "raw": msg.get("raw"),
              "read_by": msg.get("mode"), "note": msg.get("note") or "",
@@ -98,6 +110,10 @@ class DetectionLog:
             pass
 
     def _save_picture(self, img, name):
+        """Save a PNG of the status area on a background thread (so the UI never
+        waits on the disk), then delete the oldest pictures beyond
+        MAX_PICTURES. File names start with the date and time, so sorting
+        them sorts by age."""
         def work():
             try:
                 os.makedirs(self.pictures, exist_ok=True)
@@ -116,6 +132,8 @@ class DetectionLog:
             return
         now = now or time.time()
         s = self.summary
+        # Time since the previous reading, counted towards whatever state this
+        # reading is in. Capped at 5 s so a sleeping PC doesn't add hours.
         dt = 0.0 if self._last_t is None else min(5.0, max(0.0, now - self._last_t))
         self._last_t = now
         raw, shown, mode = msg.get("raw"), msg.get("shown"), msg.get("mode")
@@ -185,6 +203,8 @@ class DetectionLog:
 
     # ---------------------------------------------------------------- results
     def summary_text(self):
+        """The totals as a few readable sentences (shown in Settings and put in
+        exports)."""
         s = self.summary
         if not s["reads"]:
             return "No readings yet."
@@ -214,6 +234,7 @@ class DetectionLog:
                 z.writestr(name, text)
 
     def reset(self):
+        """Delete the whole check folder and start counting from zero."""
         with self._lock:
             shutil.rmtree(self.folder, ignore_errors=True)
         self.summary = _blank()

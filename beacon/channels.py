@@ -14,6 +14,9 @@ from email.message import EmailMessage
 
 
 def _post(url, data=None, headers=None, timeout=12):
+    """POST and return (HTTP status, reply text). HTTP errors are returned, not
+    raised, so each service can explain its own error replies; only "can't
+    connect at all" raises."""
     req = urllib.request.Request(url, data=data, headers=headers or {}, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -28,6 +31,9 @@ def _post(url, data=None, headers=None, timeout=12):
 def multipart(fields, files):
     """(body, content_type) for a multipart/form-data POST.
     files: [(field, filename, bytes, mime)]"""
+    # Multipart format: each field is a part separated by a random boundary
+    # line, with headers naming the field (and the file name and type for
+    # files), a blank line, then the data. A final "--boundary--" ends the body.
     boundary = uuid.uuid4().hex
     out = bytearray()
     for name, value in fields.items():
@@ -43,6 +49,8 @@ def multipart(fields, files):
 
 # ---------------------------------------------------------------- Telegram
 def telegram_photo(token, chat, caption, jpeg):
+    """Send a JPEG photo with a caption to a Telegram chat (Bot API sendPhoto).
+    Captions are limited to 1024 characters by Telegram."""
     body, ctype = multipart({"chat_id": chat, "caption": caption[:1000]},
                             [("photo", "snapshot.jpg", jpeg, "image/jpeg")])
     code, text = _post(f"https://api.telegram.org/bot{token}/sendPhoto", body,
@@ -57,6 +65,9 @@ def telegram_photo(token, chat, caption, jpeg):
 
 # ----------------------------------------------------------------- Discord
 def discord_send(webhook, title, body, jpeg=None):
+    """Post a message (and optionally a photo) to a Discord channel through a
+    webhook URL. Messages are cut to Discord's 2000-character limit. With a
+    photo, the message goes as "payload_json" next to the file."""
     if not webhook.startswith("https://"):
         raise RuntimeError("Paste the full Discord webhook URL (starts with https://).")
     payload = {"content": f"**{title}**\n{body}"[:1990], "username": "Beacon"}
@@ -75,6 +86,8 @@ def discord_send(webhook, title, body, jpeg=None):
 
 # ---------------------------------------------------------------- Pushover
 def pushover_send(app_token, user_key, title, body, priority=0):
+    """Send a push notification through Pushover. priority=1 (used for critical
+    alerts) makes it bypass the phone's quiet hours."""
     data = urllib.parse.urlencode({"token": app_token, "user": user_key, "title": title[:250],
                                    "message": body[:1024] or title,
                                    "priority": priority}).encode("utf-8")
@@ -90,6 +103,9 @@ def pushover_send(app_token, user_key, title, body, priority=0):
 
 # ------------------------------------------------------------------- Email
 def email_send(host, port, user, password, to, subject, body, jpeg=None, timeout=20):
+    """Send an email over SMTP, optionally with the snapshot attached. Port 465
+    uses SSL from the start; other ports (587) start plain and switch to
+    encryption with STARTTLS when the server offers it."""
     if not (host and to):
         raise RuntimeError("Fill in the mail server and the address to send to.")
     msg = EmailMessage()
@@ -125,6 +141,8 @@ def email_send(host, port, user, password, to, subject, body, jpeg=None, timeout
 
 # --------------------------------------------------------------- SMS Twilio
 def twilio_send(sid, token, sender, to, body):
+    """Send a text message through Twilio's REST API (HTTP Basic auth with the
+    account SID and auth token)."""
     if not (sid and token and sender and to):
         raise RuntimeError("Fill in the Twilio Account SID, Auth Token, From and To numbers.")
     auth = base64.b64encode(f"{sid}:{token}".encode()).decode()

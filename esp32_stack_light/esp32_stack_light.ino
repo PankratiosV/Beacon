@@ -74,6 +74,8 @@ const unsigned int BUZZ_HZ = 2700;
 
 const unsigned long TIMEOUT_MS = 5000;
 
+// Beep patterns in ms: on, off, on, off ... ending with 0 (as in the Uno
+// sketch). The last two repeat while their alarm is on.
 const unsigned int SND_DONE[]   = {110, 90, 110, 90, 110, 0};
 const unsigned int SND_PAUSED[] = {180, 0};
 const unsigned int SND_LOST[]   = {400, 200, 400, 200, 400, 0};
@@ -83,6 +85,8 @@ const unsigned int SND_ALARM[]  = {150, 100, 150, 900, 0};
 const unsigned int SND_FIRE[]   = {500, 120, 0};
 
 // ---- State ----------------------------------------------------------------
+// The status, relay and alarm state below works exactly as in the Uno sketch
+// (laser_stack_light.ino), which explains each part in more detail.
 WiFiUDP udp;
 
 char state = 'U';
@@ -105,6 +109,7 @@ bool sndLoud = false;
 byte sndStep = 0;
 unsigned long sndAt = 0;
 
+// A debounced input: a new level counts once it has been steady for a while.
 struct Input {
   int pin;
   int reading, stable;
@@ -218,6 +223,7 @@ void reply() {
 }
 
 // ---- Status changes -------------------------------------------------------
+// A new status letter: beep on a finished job, a lost connection or a pause.
 void setState(char next) {
   if (next == state) return;
   bool stopped = (next == 'R' || next == 'F' || next == 'f');
@@ -239,6 +245,8 @@ int hexDigit(char c) {
   return -1;
 }
 
+// One byte of a message from the app. After 'K' the next four bytes are hex
+// digits of the relay mask; a non-hex byte there drops the message.
 void handle(char c, unsigned long now) {
   if (hexLeft > 0) {
     int v = hexDigit(c);
@@ -269,6 +277,9 @@ void setLight(int pin, bool on) {
 }
 
 // ---- Main -----------------------------------------------------------------
+// Lights and relays off before the pins become outputs (no click at power-up),
+// inputs with pull-ups, a red-green self-test, then join the Wi-Fi network and
+// listen for UDP packets.
 void setup() {
   setLight(RED_PIN, false);
   setLight(GREEN_PIN, false);
@@ -322,6 +333,8 @@ void loop() {
     Serial.println("Wi-Fi lost, reconnecting...");
   }
 
+  // One packet from the app may hold several commands; handle each byte, then
+  // answer with the input report so the app knows the light is there.
   int size = udp.parsePacket();
   if (size > 0) {
     char buf[128];

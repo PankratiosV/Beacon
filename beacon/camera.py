@@ -4,6 +4,7 @@ and the feature explains how to turn it on."""
 
 
 def available():
+    """True if OpenCV is installed (camera snapshots possible)."""
     try:
         import cv2  # noqa: F401
         return True
@@ -12,6 +13,8 @@ def available():
 
 
 def list_cameras(max_index=4):
+    """Indexes of the cameras that open (0 is usually the built-in one).
+    CAP_DSHOW uses DirectShow, which opens quickly on Windows."""
     import cv2
     found = []
     for i in range(max_index):

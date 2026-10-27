@@ -24,6 +24,7 @@ CAPABILITIES = ["state"]
 PAIR_TIMEOUT = 35            # LightBurn's consent pop-up waits 30 s
 
 # Never send these local calls through a system proxy
+# All requests go through this opener.
 _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
@@ -36,11 +37,20 @@ class ApiError(RuntimeError):
 
 
 def token(secret, now=None):
+    """The bearer token for this minute: HMAC-SHA256 of the Unix minute number
+    (as text) with the pairing secret as key, in hex. It changes every
+    minute, so a captured token is useless soon after; LightBurn computes the
+    same value to check it. now: a Unix time, for tests."""
     minute = int(time.time() if now is None else now) // 60
     return hmac.new(secret.encode(), str(minute).encode(), hashlib.sha256).hexdigest()
 
 
 def _request(method, path, secret=None, body=None, timeout=3.0, host=HOST, port=PORT):
+    """One HTTP request to LightBurn. Sends `body` as JSON, adds the
+    Authorization header when a secret is given, and returns the JSON reply
+    as a dict. Every failure becomes an ApiError with a message a user can
+    understand (LightBurn's own "error" text when it sends one) and the HTTP
+    code, so callers can tell "not allowed" (401/403) from "not running" (0)."""
     headers = {"Accept": "application/json"}
     data = None
     if body is not None:

@@ -25,6 +25,12 @@ if not exist "%PY%" (
     if errorlevel 1 goto :failed
 )
 
+rem PyInstaller turns the script into dist\Beacon\Beacon.exe plus its _internal
+rem folder (Python and every package inside, so customers need nothing else):
+rem   --windowed            no console window
+rem   --add-data            ship the icon next to the code (found via sys._MEIPASS)
+rem   --collect-all winrt   the Windows OCR bindings load parts PyInstaller can't see
+rem   --collect-data customtkinter   its themes and fonts
 echo [1/2] Bundling the app...
 "%PY%" -m PyInstaller --noconfirm --clean --windowed ^
     --name "Beacon" ^

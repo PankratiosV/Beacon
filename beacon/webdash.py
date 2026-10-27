@@ -33,6 +33,10 @@ def local_addresses():
     return out or ["127.0.0.1"]
 
 
+# The page is plain HTML/CSS/JavaScript kept in these strings (no files to
+# ship). PAGE is the frame; __BODY__ becomes MAIN (the dashboard) or LOGIN (the
+# PIN form), and __NAME__ the app's name. The colours follow the phone's light /
+# dark setting.
 PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#0E1014"><title>__NAME__</title>
@@ -59,6 +63,9 @@ form{max-width:260px;margin:30vh auto;text-align:center}input{font-size:22px;pad
 __BODY__
 </body></html>"""
 
+# The dashboard asks /api/status every 2 seconds and redraws the orb, text,
+# progress bar and relay buttons; a button POSTs to /api/relay. The PIN from the
+# address (?pin=...) is added to every request.
 MAIN = r"""<h1>__NAME__ <small id="upd"></small></h1>
 <div class="card"><div class="orb" id="orb"></div><div class="title" id="title">…</div>
 <div class="sub" id="sub"></div><div class="bar" id="bar"><i id="fill"></i></div></div>
@@ -81,6 +88,8 @@ catch(e){document.getElementById('err').style.display='block'}}
 load();setInterval(load,2000);
 </script>"""
 
+# Shown instead of the dashboard when a PIN is set and missing or wrong.
+# Submitting reloads the page with ?pin=<what was typed>.
 LOGIN = r"""<form method="get"><h1 style="justify-content:center">__NAME__</h1>
 <input name="pin" type="password" inputmode="numeric" placeholder="PIN" autofocus>
 <p style="color:var(--muted)">Enter the PIN set in Beacon's settings</p></form>"""
@@ -98,23 +107,34 @@ class Dashboard:
         self.error = ""
 
     def running(self):
+        """True while the server is up."""
         return self.server is not None
 
     def start(self, port, pin=""):
+        """(Re)start the server on all network interfaces at `port`. False (with
+        the reason in self.error) if the port can't be used. Each request
+        runs on its own short-lived thread (ThreadingHTTPServer)."""
         self.stop()
         self.pin = str(pin or "")
         dash = self
 
         class Handler(BaseHTTPRequestHandler):
+            """Answers one HTTP request. Routes: GET / (the page), GET
+            /api/status (the state as JSON), POST /api/relay ({"index": n}
+            toggles relay n)."""
             def log_message(self, *a):
+                """Silence the default request logging to the console."""
                 pass
 
             def _ok_pin(self):
+                """True if no PIN is set or the request carries the right one."""
                 if not dash.pin:
                     return True
                 return parse_qs(urlparse(self.path).query).get("pin", [""])[0] == dash.pin
 
             def _send(self, code, body, ctype="application/json"):
+                """Send a complete response. no-store stops phones caching old
+                states."""
                 data = body.encode("utf-8") if isinstance(body, str) else body
                 self.send_response(code)
                 self.send_header("Content-Type", ctype + "; charset=utf-8")
@@ -161,12 +181,14 @@ class Dashboard:
         return True
 
     def stop(self):
+        """Stop the server (if running) and free the port."""
         if self.server:
             self.server.shutdown()
             self.server.server_close()
             self.server = None
 
     def urls(self):
+        """The addresses to open on a phone, with the PIN included."""
         if not self.server:
             return []
         suffix = f"/?pin={self.pin}" if self.pin else ""

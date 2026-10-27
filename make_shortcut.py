@@ -5,7 +5,7 @@ app's icon. Right-click one and choose "Pin to taskbar". They don't touch the
 original app's shortcuts (whose taskbar pin is named "Beacon").
 
     python make_shortcut.py          "Beacon V2": the source, real settings
-    python make_shortcut.py --dev    "Beacon 2.0.0 DEV": the source in dev mode
+    python make_shortcut.py --dev    "Beacon <version> DEV": the source in dev mode
                                      (own settings in .devdata), this folder
                                      and Start menu only. The name follows
                                      APP_VERSION; older dev shortcuts are removed.
@@ -37,6 +37,9 @@ PYTHONW = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
 
 
 def make_link(path):
+    """Write one .lnk shortcut that starts the source with pythonw (no console
+    window) and carries the AppUserModelID, so Windows groups the running
+    window with the shortcut and shows Beacon's icon on the taskbar."""
     link = pythoncom.CoCreateInstance(shell.CLSID_ShellLink, None,
                                       pythoncom.CLSCTX_INPROC_SERVER, shell.IID_IShellLink)
     link.SetPath(PYTHONW)
@@ -51,6 +54,9 @@ def make_link(path):
 
 
 def main():
+    """Create the shortcuts (dev: this folder and Start menu; otherwise also the
+    Desktop), removing old dev shortcuts first, and refresh a matching
+    taskbar pin if there is one."""
     if not os.path.exists(PYTHONW):
         sys.exit(f"Can't find pythonw.exe next to {sys.executable}")
     programs = shell.SHGetFolderPath(0, shellcon.CSIDL_PROGRAMS, None, 0)

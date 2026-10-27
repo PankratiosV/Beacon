@@ -92,10 +92,14 @@ const int RELAY_COUNT = sizeof(RELAY_PINS) / sizeof(RELAY_PINS[0]);
 const bool PASSIVE_BUZZER = true;
 const unsigned int BUZZ_HZ = 2700;
 
+// TIMEOUT_MS: silence from the app this long switches lights and relays off.
+// REPORT_MS: how often the inputs are reported back to the app.
 const unsigned long TIMEOUT_MS = 5000;
 const unsigned long REPORT_MS = 250;
 
 // Beep patterns in ms: on, off, on, off ... ending with 0
+// A pattern is played by updateSound(): even steps are buzzer-on times, odd
+// steps buzzer-off times, and the 0 marks the end.
 const unsigned int SND_DONE[]   = {110, 90, 110, 90, 110, 0};
 const unsigned int SND_PAUSED[] = {180, 0};
 const unsigned int SND_LOST[]   = {400, 200, 400, 200, 400, 0};
@@ -105,6 +109,8 @@ const unsigned int SND_ALARM[]  = {150, 100, 150, 900, 0};   // repeats while on
 const unsigned int SND_FIRE[]   = {500, 120, 0};             // repeats while on
 
 // ---- State ----------------------------------------------------------------
+// state: the last status letter received. lastMsg / gotAny: for the timeout.
+// inJob: Running or Paused was seen, so a later Ready means "job finished".
 char state = 'U';
 unsigned long lastMsg = 0;
 bool gotAny = false;
@@ -128,6 +134,10 @@ byte sndStep = 0;
 unsigned long sndAt = 0;
 
 // A debounced input
+// Mechanical switches "bounce" (flicker on/off for a few ms when pressed), so a
+// new level only counts once it has been steady for a while. reading = the
+// latest raw level, stable = the accepted level, changed = when reading last
+// changed.
 struct Input {
   int pin;
   int reading, stable;
@@ -154,6 +164,8 @@ bool debounce(Input& in, unsigned long now, unsigned long ms) {
 }
 
 // ---- Buzzer ---------------------------------------------------------------
+// A passive buzzer needs a square wave (tone) to make a sound; an active one
+// beeps by itself when powered.
 void buzz(bool on) {
   if (PASSIVE_BUZZER) {
     if (on) tone(BUZZER_PIN, BUZZ_HZ); else noTone(BUZZER_PIN);
@@ -162,6 +174,8 @@ void buzz(bool on) {
   }
 }
 
+// Sound player: one pattern at a time. "Loud" patterns are alarms: they repeat,
+// override the everyday beeps and ignore the mute switch.
 void stopSound() {
   snd = NULL;
   buzz(false);
@@ -175,15 +189,20 @@ void start(const unsigned int* pattern, bool loud) {
   buzz(true);
 }
 
+// An alarm (fire, or one raised by the app) that hasn't been silenced yet.
 bool alarmSounding() {
   return (fireAlarm || appAlarm) && !silenced;
 }
 
+// An everyday beep: only when the buzzer switch is on and no alarm is busy.
 void play(const unsigned int* pattern) {
   if (!buzzerEnabled || alarmSounding()) return;
   start(pattern, false);
 }
 
+// Called every loop: starts or stops the alarm sound as needed, then moves the
+// current pattern on when its step's time is up (never blocks, so the lights
+// and serial keep working while it beeps).
 void updateSound(unsigned long now) {
   // Alarms take over the buzzer and repeat until silenced
   const unsigned int* alarm = !alarmSounding() ? NULL : (fireAlarm ? SND_FIRE : SND_ALARM);
@@ -203,11 +222,16 @@ void updateSound(unsigned long now) {
 }
 
 // ---- Inputs ---------------------------------------------------------------
+// The button or 'X': stop the alarm sound. A fire alarm stays latched until the
+// sensor is clear too.
 void silence() {
   silenced = true;
   if (fire.stable != FIRE_ACTIVE) fireAlarm = false;   // fire is over: clear it
 }
 
+// Read and debounce every input. The buzzer switch and the button act at once;
+// fire / lid / flow levels are reported to the app, which decides on alerts
+// (except fire, which this board alarms on by itself).
 void updateInputs(unsigned long now) {
   if (debounce(sw, now, 30)) {
     buzzerEnabled = (sw.stable == LOW);
@@ -229,6 +253,8 @@ void updateInputs(unsigned long now) {
   debounce(flow, now, 200);
 }
 
+// Send "S,fire,temp,lid,flow,presses" to the app every REPORT_MS. The app
+// parses it with parse_inputs() in laser_status_app.py.
 void report(unsigned long now) {
   if (now - lastReport < REPORT_MS) return;
   lastReport = now;
@@ -245,6 +271,8 @@ void report(unsigned long now) {
 }
 
 // ---- Status changes -------------------------------------------------------
+// A new status letter from the app. Beeps on the changes that matter: a job
+// ending normally (3 quick), a job lost to a disconnect (3 long), a pause (1).
 void setState(char next) {
   if (next == state) return;
   bool stopped = (next == 'R' || next == 'F' || next == 'f');
@@ -261,6 +289,7 @@ void setState(char next) {
 }
 
 // ---- Main -----------------------------------------------------------------
+// The value of one hex digit, or -1 if c isn't one.
 int hexDigit(char c) {
   if (c >= '0' && c <= '9') return c - '0';
   if (c >= 'A' && c <= 'F') return c - 'A' + 10;
@@ -268,10 +297,14 @@ int hexDigit(char c) {
   return -1;
 }
 
+// Switch a light or relay output, honouring OUTPUT_ON (active-high driver or
+// active-low relay board).
 void setLight(int pin, bool on) {
   digitalWrite(pin, on ? OUTPUT_ON : !OUTPUT_ON);
 }
 
+// Runs once at power-up (and every time the app opens the USB port, which
+// resets an Uno).
 void setup() {
   // Set the "off" level before enabling outputs so relays don't click at boot
   setLight(RED_PIN, false);
@@ -304,6 +337,12 @@ void setup() {
   play(SND_CHIRP);
 }
 
+// Runs over and over, thousands of times a second:
+// 1. read every byte the app sent and act on it
+// 2. if the app has gone quiet for TIMEOUT_MS, forget everything
+// 3. inputs, sound and the input report
+// 4. work out the light colours (fire overrides everything) and set the lights
+//    and relays
 void loop() {
   unsigned long now = millis();
 
@@ -347,6 +386,8 @@ void loop() {
   updateSound(now);
   report(now);
 
+  // Blinking without delay(): the time decides whether a blink is in its on or
+  // off half.
   bool fast = (now / 300) % 2;   // framing blink
   bool slow = (now / 700) % 2;   // disconnected blink
 

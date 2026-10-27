@@ -19,6 +19,9 @@ import win32api
 import win32con
 import win32gui
 
+# Win32 constants: the private message the tray icon sends our window, balloon /
+# toast flags pywin32 doesn't name, the hotkey's id, "don't repeat while held",
+# and the registry key of programs started at sign-in.
 WM_TRAY = win32con.WM_USER + 20
 NIF_INFO, NIIF_USER, NIIF_LARGE_ICON = 0x10, 0x04, 0x20
 HOTKEY_ID = 0xB33C
@@ -36,6 +39,7 @@ def launch_command(script_path):
 
 
 def autostart_get(name):
+    """True if a "start with Windows" entry called `name` exists."""
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
             winreg.QueryValueEx(k, name)
@@ -45,6 +49,8 @@ def autostart_get(name):
 
 
 def autostart_set(name, on, command):
+    """Add (on=True) or remove the "start with Windows" entry: a value under
+    HKCU\...\Run, which Windows runs at sign-in. Per user, no admin rights."""
     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
         if on:
             winreg.SetValueEx(k, name, 0, winreg.REG_SZ, command)
@@ -77,6 +83,9 @@ def firewall_allow(port, rule=FIREWALL_RULE):
     """Ask Windows (one UAC prompt the user answers) to let phones on Private
     networks reach the dashboard port. False if the prompt was declined."""
     rule = f'name="{rule}"'
+    # Delete-then-add, so a changed port replaces the old rule instead of adding
+    # a second one. "runas" is what triggers the UAC prompt; ShellExecute
+    # returns a value above 32 on success.
     cmd = (f'/c netsh advfirewall firewall delete rule {rule} & '
            f'netsh advfirewall firewall add rule {rule} dir=in action=allow '
            f'protocol=TCP localport={int(port)} profile=private')
@@ -85,6 +94,8 @@ def firewall_allow(port, rule=FIREWALL_RULE):
 
 # ------------------------------------------------------------------ idle time
 class _LASTINPUTINFO(ctypes.Structure):
+    """The struct GetLastInputInfo fills in (dwTime = tick count of the last
+    input)."""
     _fields_ = [("cbSize", ctypes.wintypes.UINT), ("dwTime", ctypes.wintypes.DWORD)]
 
 
@@ -112,6 +123,9 @@ class TrayHost:
         self._create_window()
 
     def _create_window(self):
+        """Create the hidden message-only window and load the icon. The window
+        procedure is a dict of message -> handler (a pywin32 shortcut). The
+        class name includes id(self) so two hosts never clash."""
         wc = win32gui.WNDCLASS()
         wc.hInstance = win32api.GetModuleHandle(None)
         wc.lpszClassName = f"BeaconTrayHost{id(self)}"
@@ -130,6 +144,7 @@ class TrayHost:
 
     # tray icon -----------------------------------------------------------
     def show_icon(self):
+        """Put the icon in the notification area. True if it's there."""
         if self.icon_shown:
             return True
         try:
@@ -142,6 +157,7 @@ class TrayHost:
         return self.icon_shown
 
     def hide_icon(self):
+        """Remove the icon from the notification area."""
         if self.icon_shown:
             try:
                 win32gui.Shell_NotifyIcon(win32gui.NIM_DELETE, (self.hwnd, 1))
@@ -150,6 +166,8 @@ class TrayHost:
             self.icon_shown = False
 
     def set_tip(self, tip):
+        """The text shown when hovering the icon (Windows allows 127
+        characters)."""
         if self.icon_shown:
             try:
                 win32gui.Shell_NotifyIcon(win32gui.NIM_MODIFY, (
@@ -173,6 +191,9 @@ class TrayHost:
     show = notify                   # same call the older notifier used
 
     def _on_tray(self, hwnd, msg, wparam, lparam):
+        """Window procedure for the icon's messages: lparam says which mouse
+        event happened. Right-click opens the menu, a click opens the window.
+        Runs inside Tk's dispatch, so only posts (see the module docstring)."""
         if lparam in (win32con.WM_RBUTTONUP, win32con.WM_CONTEXTMENU) and self.on_menu:
             x, y = win32gui.GetCursorPos()
             self.post(lambda: self.on_menu(x, y))
@@ -193,19 +214,23 @@ class TrayHost:
         return bool(ok)
 
     def clear_hotkey(self):
+        """Release the hotkey, if one is registered."""
         if self.hotkey:
             ctypes.windll.user32.UnregisterHotKey(self.hwnd, HOTKEY_ID)
             self.hotkey = None
 
     def _on_hotkey_msg(self, hwnd, msg, wparam, lparam):
+        """Window procedure for WM_HOTKEY: our hotkey was pressed."""
         if wparam == HOTKEY_ID and self.on_hotkey:
             self.post(self.on_hotkey)
         return 0
 
     def remove(self):
+        """Remove the icon and hotkey (called when Beacon quits)."""
         self.close()
 
     def close(self):
+        """Release the hotkey, remove the icon and destroy the hidden window."""
         self.clear_hotkey()
         self.hide_icon()
         try:

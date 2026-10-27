@@ -1,20 +1,55 @@
 #!/usr/bin/env python3
 """
-Laser Status - a job light for LightBurn (Windows 10/11)
+Beacon - live laser status for LightBurn (Windows 10/11)
 
-Reads LightBurn's Laser panel status (Ready / Busy / Paused / Framing /
-Disconnected) and shows it in a small modern window, optionally driving an
-Arduino red/green light too. Nothing in LightBurn or the laser is changed.
+Reads what LightBurn's Laser panel says (Ready / Busy / Paused / Framing /
+Disconnected) and shows it in a small window or floating pill, on an Arduino
+or ESP32 stack light, and on your phone. It times every job, keeps
+statistics and sends notifications. Nothing in LightBurn or the laser is
+changed: Beacon only reads.
 
 Setup (once), in a Command Prompt:
     pip install customtkinter pyserial pywin32 pillow psutil winrt-runtime winrt-Windows.Foundation winrt-Windows.Foundation.Collections winrt-Windows.Media.Ocr winrt-Windows.Graphics.Imaging winrt-Windows.Storage.Streams winrt-Windows.Globalization
+(or double-click "Install requirements.bat")
 
 Run:
     double-click "Start Laser Status.bat", or:  python laser_status_app.py
+    python laser_status_app.py --dev     a separate dev copy (see DEV below)
 
-Settings are saved in %APPDATA%\\LaserStatus\\settings.json
+Settings are saved in %APPDATA%\\LaserStatusV2\\settings.json
+
+How the code fits together (top to bottom in this file):
+
+  Settings            DEFAULTS, load_settings(), save_settings()
+  Window capture      find LightBurn's windows and screenshot them
+  Text recognition    WindowsOCR (built into Windows), TesseractOCR fallback
+  Status matching     find_status(): OCR text -> "busy", "ready", ...
+  Detection engine    background threads that read LightBurn and post what
+                      they see to a queue:
+                        Detector        reads the screen (any version)
+                        ApiDetector     LightBurn 2.2+ REST API (beacon/lbapi.py)
+                        HybridDetector  both together
+  Light links         ArduinoLink (USB serial), NetLight (ESP32 over UDP);
+                      the protocol is described above LinkBase
+  RunLog              the job history (jobs.jsonl): running stretches only
+  Look & feel         colours, rounded panels, the job-finished chime
+  Notifications       Telegram calls, usage reports
+  App                 the window, its pages and all the glue: poll() reads
+                      the detector queue on the UI thread, set_state() turns
+                      readings into status changes, render() redraws
+  Chart, StatsView    the Statistics page
+  main()              single-instance check, OCR start-up, App
+
+Feature modules live in beacon/ (see the imports below). Arduino and ESP32
+sketches are in laser_stack_light/ and esp32_stack_light/.
+
+Threads: Tk may only be used from the main (UI) thread. Every background
+thread hands results to the UI through App.q (see App._on_ui and App.poll).
 """
 
+# Standard library only in this first block; the third-party packages are
+# imported further down inside try/except so a missing one gives a friendly
+# message box instead of a crash.
 import asyncio
 import csv
 import ctypes
@@ -35,6 +70,9 @@ import tkinter as tk
 from datetime import date, datetime, timedelta
 from tkinter import filedialog, messagebox, ttk
 
+# App identity. These few names decide what the user sees (window title,
+# taskbar, installer shortcut) and where the settings live. Change APP_VERSION
+# together with MyAppVersion in installer/LaserStatus.iss when you release.
 APP_NAME = "Beacon"
 HEADER_TEXT = "Live Laser Status"   # heading inside the main window (title bar says APP_NAME)
 APP_VERSION = "2.1.0"   # keep in step with installer\LaserStatus.iss
@@ -51,6 +89,8 @@ SETTINGS_FOLDER = "LaserStatusV2"
 DEV = "--dev" in sys.argv and not getattr(sys, "frozen", False)
 RELEASE_LABEL = "BETA"    # in the title and installer shortcuts; "" for a final release
 WINDOW_TITLE = f"{APP_NAME} {APP_VERSION} {RELEASE_LABEL}".strip()
+# Dev mode replaces the visible names so the two copies are easy to tell apart
+# on the taskbar and in the title bar.
 if DEV:
     APP_NAME = "Beacon (dev)"       # pairing, autostart, firewall rule: keep version-free
     WINDOW_TITLE = f"Beacon {APP_VERSION} DEV"
@@ -69,9 +109,18 @@ def fatal(msg):
     sys.exit(1)
 
 
+# Beacon uses Win32 APIs (window capture, tray icon, hotkeys, Windows OCR), so
+# it can't run anywhere else.
 if sys.platform != "win32":
     fatal("This app is for Windows.")
 
+# Third-party packages. Each import is tried on its own and the names of the
+# missing ones are collected, so a user running from source learns in one
+# message exactly which `pip install` to run.
+# - customtkinter: the modern-looking widgets the whole UI is built from
+# - pywin32 (win32gui, win32ui, ...): finding and capturing LightBurn's window
+# - psutil: telling which process owns a window ("is this LightBurn?")
+# - pillow: images (screen captures, the rounded panels, the tray icon)
 _missing = []
 try:
     import customtkinter as ctk
@@ -104,9 +153,15 @@ def _smooth_wheel():
     every WHEEL_MS instead (same distance overall)."""
     from customtkinter.windows.widgets.ctk_scrollable_frame import CTkScrollableFrame
     original = CTkScrollableFrame._mouse_wheel_all
+    # 16 ms is about one screen refresh at 60 Hz: the page moves at most once
+    # per frame, which is as smooth as the eye can see anyway.
     WHEEL_MS = 16
 
     def flush(self):
+        """Apply all the wheel ticks gathered since the last jump in one scroll.
+        Windows sends 120 per notch; CustomTkinter's own handler scrolls
+        delta/6 units, so the same formula keeps the scroll distance
+        unchanged."""
         self._wheel_job = None
         delta, self._wheel_delta = self._wheel_delta, 0
         steps = -int(delta / 6)
@@ -117,6 +172,9 @@ def _smooth_wheel():
             pass
 
     def wheel(self, event):
+        """Replacement wheel handler: only adds up the ticks and schedules one
+        flush() a frame later. Shift+wheel (sideways scroll) keeps the
+        original."""
         if not sys.platform.startswith("win") or self._shift_pressed:
             return original(self, event)
         if not self._check_if_valid_scroll(event.widget):
@@ -125,12 +183,17 @@ def _smooth_wheel():
         if not getattr(self, "_wheel_job", None):
             self._wheel_job = self.after(WHEEL_MS, lambda: flush(self))
 
+    # Monkey-patch: every scrollable page in the app now uses the gathered
+    # version. Done once at import time, before any window exists.
     CTkScrollableFrame._mouse_wheel_all = wheel
 
 
 _smooth_wheel()
 
 try:
+    # Optional packages: the app still runs without them, just without that
+    # feature. pyserial talks to the Arduino over USB; winsound plays the
+    # Windows chime.
     import serial
     import serial.tools.list_ports
     HAVE_SERIAL = True
@@ -142,6 +205,16 @@ try:
 except ImportError:
     winsound = None
 
+# Beacon's own modules (folder beacon/), each one feature kept out of this file:
+# - camera: webcam snapshot attached to alerts
+# - channels: Discord, Pushover, email and SMS senders
+# - exporters: CSV / Excel / PDF reports
+# - smartplugs: Shelly / Tasmota / Home Assistant switches used as relays
+# - updater: checks UPDATE_URL for a newer version
+# - webdash: the phone dashboard (a tiny web server on your Wi-Fi)
+# - winsys: tray icon, global hotkey, autostart, firewall rule, idle time
+# - lbapi: LightBurn 2.2+ REST API client (the "API" detection mode)
+# - detectlog: the opt-in log of how accurately LightBurn was read
 import logging
 import platform
 import webbrowser
@@ -156,6 +229,8 @@ UPDATE_URL = ""
 SUPPORT_EMAIL = ""      # shown in Help when set, e.g. "support@yourshop.com"
 TIP_URL = ""            # tip page (Ko-fi, PayPal.me, GitHub Sponsors...); the setup's last page
                         # shows a "Tip $5" button when set
+# Questions and answers shown on the Help page, in this order. Plain text; the
+# page wraps them itself.
 HELP_FAQ = [
     ("It says “Not found”.",
      "Open LightBurn and show the Laser panel (Window › Laser). LightBurn can sit behind "
@@ -188,11 +263,18 @@ APP_ID = "LaserStatusV2.Dev" if DEV else "LaserStatusV2.App"
 BASE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
 ICON_PATH = os.path.join(BASE_DIR, "laser_status.ico")
 try:
+    # Tell Windows this process is "Beacon", not "Python", so the taskbar groups
+    # the window with its pinned shortcut and shows Beacon's icon.
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
 except Exception:
     pass
 
 try:
+    # Per-monitor DPI awareness: without it Windows scales the window as a
+    # blurry bitmap on high-DPI screens, and (important for OCR) window
+    # coordinates and captures would be in scaled pixels that don't match the
+    # real screen. SetProcessDPIAware is the older fallback for Windows versions
+    # without shcore.
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
 except Exception:
     try:
@@ -204,10 +286,23 @@ except Exception:
 # ===========================================================================
 # Settings
 # ===========================================================================
+# All user data lives in one folder: %APPDATA%\LaserStatusV2 (dev mode: the
+# .devdata folder next to this file). Files in it:
+# - settings.json: everything in DEFAULTS below, saved as you change it
+# - jobs.jsonl: one line per finished job (see RunLog)
+# - open_job.json: the job running right now, so a crash doesn't lose it
+# - job_meta.json: customer / material edits made later on the Statistics page
+# - sounds/: your own copy of a chosen finish sound
+# - logs/: beacon.log, the app's log (see setup_logging)
+# - detection-check/: the opt-in detection log and its pictures
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), SETTINGS_FOLDER)
 if DEV:
     CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".devdata")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "settings.json")
+# Every setting and its default value. load_settings() starts from this and
+# overlays what's saved, keeping only keys that exist here; so a new setting
+# just needs a line here, and an old one removed from here is dropped from the
+# file on the next save. Keys are grouped by the Settings section using them.
 DEFAULTS = {
     "blink": False,          # blink for Framing / Disconnected
     "topmost": True,
@@ -289,16 +384,22 @@ DEFAULTS = {
     "lb_api_trusted": {},        # devices whose "connected" flag can be believed
 }
 
+# Starting maintenance reminders (Statistics › Maintenance). every_h = laser-on
+# hours between services, last_h = the total laser hours when it was last done.
 MAINT_DEFAULTS = [
     {"name": "Clean the lens / protective window", "every_h": 40, "last_h": 0.0},
     {"name": "Clean the exhaust fan and duct", "every_h": 100, "last_h": 0.0},
     {"name": "Check belts, rails and mirrors", "every_h": 200, "last_h": 0.0},
     {"name": "Cooling check (chiller water / fans)", "every_h": 500, "last_h": 0.0},
 ]
+# Last values typed into the quote calculator, so it opens as you left it.
 QUOTE_DEFAULTS = {"minutes": 10.0, "qty": 1, "material": 0.0, "setup": 0.0, "margin": 50.0}
 if DEV:     # don't fight the installed Beacon for its hotkey or dashboard port
     DEFAULTS.update(hotkey_key="D", dash_port=8766)
 
+# Running-cost inputs used to turn laser time into money (cost_per_hour):
+# electricity (power_kw x kwh_price), wear (machine_price / lifetime_h) and the
+# per-hour maintenance, labour and other costs.
 COST_DEFAULTS = {"currency": "$", "power_kw": 0.5, "kwh_price": 0.15, "machine_price": 0.0,
                  "lifetime_h": 10000.0, "maint_h": 0.0, "labor_h": 0.0, "other_h": 0.0}
 
@@ -306,6 +407,8 @@ COST_DEFAULTS = {"currency": "$", "power_kw": 0.5, "kwh_price": 0.15, "machine_p
 # light, buzzer and buzzer switch; A1-A5 are the safety inputs).
 # Order must match RELAY_PINS in laser_stack_light.ino.
 RELAY_PINS = ["D2", "D3", "D5", "D6", "D7", "D11", "D12", "D13", "A0"]
+# Choices offered in the relay editor. The dict key is what's saved, the value
+# is what the dropdown shows.
 ON_DELAYS = {0: "At once", 5: "After 5 s", 10: "After 10 s", 30: "After 30 s", 60: "After 1 min"}
 SCHED_DAYS = {"every": "Every day", "weekdays": "Mon–Fri", "weekends": "Sat–Sun"}
 # key: (label, statuses that switch the relay on by itself)
@@ -316,11 +419,18 @@ AUTO_MODES = {
     "framing": ("While framing", ("framing",)),
     "active":  ("Running, paused or framing", ("busy", "paused", "framing")),
 }
+# How long an automatic relay stays on after its status ends (e.g. keep the
+# exhaust fan running a minute after the job to clear the smoke).
 KEEP_ON = {0: "No delay", 10: "+10 s after", 30: "+30 s after", 60: "+1 min after",
            120: "+2 min after", 300: "+5 min after"}
 
 
 def default_relays():
+    """One settings dict per relay pin, all off and manual. Fields: name (button
+    label), use (show the button), auto (an AUTO_MODES key), keep (KEEP_ON
+    seconds), on_delay (ON_DELAYS seconds), sched_* (switch on by time of
+    day), target ("arduino" pin, or a smart plug / Home Assistant switch at
+    address / entity)."""
     return [{"name": f"Relay {i + 1}", "use": False, "auto": "manual", "keep": 0,
              "on_delay": 0, "sched_on": False, "sched_start": 8, "sched_end": 17,
              "sched_days": "every", "target": "arduino", "address": "", "entity": ""}
@@ -328,12 +438,17 @@ def default_relays():
 
 
 def load_settings():
+    """Read settings.json over DEFAULTS and repair anything missing or of the
+    wrong type, so the rest of the app can trust every key exists. A missing
+    or broken file just gives the defaults (first run)."""
     s = dict(DEFAULTS)
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             s.update({k: v for k, v in json.load(f).items() if k in DEFAULTS})
     except Exception:
         pass
+    # Merge saved relays field by field into fresh defaults: a settings file
+    # from an older version (fewer fields or fewer relays) still loads cleanly.
     relays = default_relays()
     for r, saved in zip(relays, s.get("relays") or []):
         if isinstance(saved, dict):
@@ -356,6 +471,9 @@ def load_settings():
 
 
 def save_settings(s):
+    """Write all settings to settings.json. Failures (disk full, folder
+    read-only) are ignored on purpose: losing a setting is better than a
+    crash."""
     try:
         os.makedirs(CONFIG_DIR, exist_ok=True)
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
@@ -367,11 +485,18 @@ def save_settings(s):
 # ===========================================================================
 # Finding and capturing LightBurn's windows
 # ===========================================================================
+# PrintWindow flag that asks the window to draw itself fully into our bitmap,
+# including GPU-drawn (Qt / DirectX) content like LightBurn's. Without it the
+# capture is often black.
 PW_RENDERFULLCONTENT = 2
+# pid -> process name. Asking Windows for a process name is slow-ish and the
+# window list is walked every check, so names are remembered.
 _name_cache = {}
 
 
 def process_name(pid):
+    """The .exe name of a process ("LightBurn.exe"), or "" if it's gone or
+    protected."""
     if pid not in _name_cache:
         try:
             _name_cache[pid] = psutil.Process(pid).name()
@@ -381,9 +506,16 @@ def process_name(pid):
 
 
 def find_lightburn_windows(include_minimized=False):
+    """Handles (hwnd) of LightBurn's visible top-level windows that are big
+    enough to hold the Laser panel (tiny tool windows and pop-ups are
+    skipped). Minimised windows report a tiny size, so they're only included
+    on request; they can't be read on screen but the title bar still names
+    the open file."""
     hwnds = []
 
     def callback(hwnd, _):
+        """Called by EnumWindows once per top-level window. Return True to keep
+        going."""
         if not win32gui.IsWindowVisible(hwnd):
             return True
         if win32gui.IsIconic(hwnd):
@@ -405,6 +537,8 @@ def find_lightburn_windows(include_minimized=False):
 
 
 def lightburn_running():
+    """True if any LightBurn process exists, even with no window open (used to
+    tell "LightBurn is closed" from "the Laser panel isn't visible")."""
     for p in psutil.process_iter(["name"]):
         if "lightburn" in (p.info.get("name") or "").lower():
             return True
@@ -412,6 +546,13 @@ def lightburn_running():
 
 
 def capture_window(hwnd):
+    """Screenshot one window into a PIL image by asking it to paint itself
+    (PrintWindow). Works even when other windows cover it, which a plain
+    screen grab can't. Returns None if the window refuses.
+
+    The Win32 objects (device contexts, bitmap) must always be released,
+    hence the try/finally: leaking them every second would exhaust GDI
+    handles."""
     l, t, r, b = win32gui.GetWindowRect(hwnd)
     w, h = r - l, b - t
     if w <= 0 or h <= 0:
@@ -437,11 +578,18 @@ def capture_window(hwnd):
 
 
 def is_blank(img):
+    """True for an all-one-colour image (shrunk to 64x64 and greyscale first, so
+    it's quick). Some windows answer PrintWindow with a black or white
+    picture."""
     lo, hi = img.convert("L").resize((64, 64)).getextrema()
     return hi - lo < 10
 
 
 def capture_best(hwnd):
+    """A screenshot of the window, by whichever method gives a real picture:
+    PrintWindow first (works when covered), then a plain screen grab of the
+    window's rectangle (works for windows that refuse PrintWindow but only
+    shows what's actually visible). None if both fail."""
     img = capture_window(hwnd)
     if img is not None and not is_blank(img):
         return img
@@ -461,6 +609,11 @@ def capture_best(hwnd):
 # with positions in the coordinates of the image passed in.
 # ===========================================================================
 class WindowsOCR:
+    """Text recognition with the OCR engine built into Windows 10/11 (no extra
+    install, fast). Talks to it through the winrt Python packages.
+
+    The WinRT API is async, so a private asyncio event loop is kept and each
+    call is run to completion on it from the detector thread."""
     name = "Windows OCR"
 
     def __init__(self):
@@ -482,6 +635,10 @@ class WindowsOCR:
         self.working = None
 
     def read(self, img, max_scale=2.0):
+        """Recognise the text in img. Small images are enlarged (up to
+        max_scale) because the engine reads tiny UI text much better at 2x;
+        never beyond the engine's maximum image size. Word boxes are scaled
+        back to img's own coordinates so callers can crop at the right place."""
         scale = min(max_scale, self.max_dim / max(img.width, img.height))
         if abs(scale - 1.0) > 0.01:
             img = img.resize((max(1, int(img.width * scale)),
@@ -497,6 +654,10 @@ class WindowsOCR:
         return out
 
     def _recognize_any(self, img):
+        """Run OCR, trying the ways of building a Windows bitmap until one
+        works. Different winrt package versions accept different call
+        signatures, so the first that succeeds is remembered (self.working)
+        and tried first next time."""
         order = ([self.working] if self.working else []) + \
                 [m for m in (self._bmp_copy4, self._bmp_copy5, self._bmp_decoder)
                  if m is not self.working]
@@ -512,20 +673,26 @@ class WindowsOCR:
         raise RuntimeError(" / ".join(errors))
 
     def _bgra_buffer(self, img):
+        """The image's pixels as a WinRT buffer in BGRA order (what Windows
+        wants)."""
         writer = self.DataWriter()
         writer.write_bytes(img.convert("RGBA").tobytes("raw", "BGRA"))
         return writer.detach_buffer()
 
     async def _bmp_copy4(self, img):
+        """Build the bitmap straight from pixels (4-argument form)."""
         return self.SoftwareBitmap.create_copy_from_buffer(
             self._bgra_buffer(img), self.BitmapPixelFormat.BGRA8, img.width, img.height)
 
     async def _bmp_copy5(self, img):
+        """Same, with the alpha mode given (5-argument form some versions need)."""
         return self.SoftwareBitmap.create_copy_from_buffer(
             self._bgra_buffer(img), self.BitmapPixelFormat.BGRA8, img.width, img.height,
             self.BitmapAlphaMode.PREMULTIPLIED)
 
     async def _bmp_decoder(self, img):
+        """Slowest but most compatible: encode a PNG in memory and let Windows
+        decode it into a bitmap."""
         from winrt.windows.storage.streams import InMemoryRandomAccessStream
         from winrt.windows.graphics.imaging import BitmapDecoder
         png = io.BytesIO()
@@ -542,6 +709,8 @@ class WindowsOCR:
 
 
 class TesseractOCR:
+    """Fallback OCR using Tesseract (a separate free install), for PCs where
+    Windows OCR isn't available (no OCR language pack installed)."""
     name = "Tesseract"
 
     def __init__(self):
@@ -553,6 +722,10 @@ class TesseractOCR:
         self.pt = pytesseract
 
     def read(self, img, max_scale=2.0):
+        """Same contract as WindowsOCR.read. Tesseract returns words with block
+        / paragraph / line numbers; words are grouped back into lines here.
+        "--psm 11" = sparse text: find as much text as possible in no set
+        order, which suits a UI screenshot better than page layout analysis."""
         s = max_scale
         big = img.resize((int(img.width * s), int(img.height * s)), Image.LANCZOS).convert("L")
         d = self.pt.image_to_data(big, config="--psm 11", output_type=self.pt.Output.DICT)
@@ -567,6 +740,8 @@ class TesseractOCR:
 
 
 def make_ocr():
+    """The first OCR engine that starts, as (engine, None), or (None, reasons)
+    when none can be used."""
     errors = []
     for cls in (WindowsOCR, TesseractOCR):
         try:
@@ -579,10 +754,16 @@ def make_ocr():
 # ===========================================================================
 # Status matching
 # ===========================================================================
+# Turning OCR text into a status. LightBurn's Laser panel shows one of these
+# words. If several are found on screen (another panel may mention "Ready"), the
+# earliest in this list wins: a job that's running matters more.
 STATUS_WORDS = ["paused", "busy", "framing", "disconnected", "ready"]   # priority order
 
 
 def _close_enough(word, target):
+    """True if an OCR'd word is the status word, allowing one misread letter in
+    long words ("disconected", "framimg"): OCR on small UI text isn't
+    perfect."""
     if word == target:
         return True
     # Short words must match exactly so "read"/"already" don't count.
@@ -626,6 +807,8 @@ def find_status(lines):
     return None, None
 
 
+# Used to tell Paused from Busy on LightBurn versions that keep showing "Busy"
+# during a pause: the button under the status reads "Resume" instead.
 def find_pause_button(lines):
     """Returns ("pause" or "resume", (x, y, w, h)) for a Pause/Resume button."""
     for text, words in lines:
@@ -641,8 +824,18 @@ def find_pause_button(lines):
 # ===========================================================================
 # Detection engine (runs in a background thread)
 # ===========================================================================
+# How the screen reader works, in short:
+# 1. Find LightBurn's windows and screenshot them.
+# 2. OCR the whole window once to find where the status word is.
+# 3. From then on only OCR a small box around that spot (much faster), until the
+#    word isn't there any more; then go back to step 2.
+# 4. Debounce: a new status must be read the same way twice in a row before it
+#    is reported (one misread frame can't flash the light).
+# The result goes to the UI thread through a queue (out_q); the detector never
+# touches the window itself, because Tk isn't thread-safe.
 FULL_SCAN_GAP = 1.0     # seconds between whole-window scans, whatever the check speed
 SKIP = object()         # scan() result meaning "nothing read this time"
+# "63%", "63 %" but not the "3%" inside "163%". Used for the job's progress.
 PROGRESS_RE = re.compile(r"(?<!\d)(\d{1,3})\s?%")
 
 
@@ -673,6 +866,13 @@ class Detector(threading.Thread):
     each time (fast, light on CPU). If it disappears, the whole window is
     scanned again."""
 
+    # State kept between checks (all of it belongs to this thread):
+    # - region: where the status word was last found, so only that box is read
+    # - shown: the confirmed status being reported; pending/pending_count: a
+    #   different status seen but not yet confirmed (see debounce)
+    # - lf_*: the same "remember where it was" trick for the Live Framing window
+    # - since: set when a change really began earlier than this check (the
+    #   debounce wait or the API's hold), so the UI can backdate job times
     def __init__(self, ocr, out_q, interval):
         super().__init__(daemon=True)
         self.ocr = ocr
@@ -697,6 +897,13 @@ class Detector(threading.Thread):
         self.last_full = self.lf_last_full = 0.0
 
     def run(self):
+        """The thread's loop: scan, debounce, send one message to the UI, sleep
+        until the next check. Every message carries everything the UI needs
+        (the status, raw reading, a note for the banner, the OCR text for
+        Diagnostics, progress %, the open file's name and the picture read),
+        so the UI never has to ask the detector anything. A scan that crashes
+        is logged and reported as "Detection error" instead of killing the
+        thread."""
         while not self.stop_evt.is_set():
             start = time.time()
             self.crop = self.since = None
@@ -713,15 +920,24 @@ class Detector(threading.Thread):
                                 "file": self.file_name, "crop": self.crop,
                                 "since": self.since})
             # No LightBurn window: checking for its process is slow, so don't rush
+            # Sleep only what's left of the interval, so checks stay evenly
+            # spaced however long the OCR took (never less than 20 ms, to leave
+            # the CPU some air).
             gap = max(self.interval, 1.0) if mode == "none" else self.interval
             self.stop_evt.wait(max(0.02, gap - (time.time() - start)))
 
     def progress_from(self, lines):
+        """The job's progress % for this reading. Screen: parsed from the OCR
+        text. The API reader overrides this with the number the API gives."""
         return parse_progress(lines)
 
     CONFIRM_READS = 2   # readings in a row before Ready / Framing / Disconnected show
 
     def debounce(self, status):
+        # Worked example at 0.5 s checks: Ready, Ready, *Framing*, Framing ->
+        # the first Framing is pending (count 1), the second confirms it (count
+        # 2) and `since` is set to the time of the first one, half a second
+        # earlier.
         # Busy/Paused show at once; other changes need CONFIRM_READS reads in a
         # row ("not found" needs 3 and at least 1 s) so one misread can't flip
         # the light. A confirmed change is dated from its first reading
@@ -759,6 +975,10 @@ class Detector(threading.Thread):
         return status
 
     def live_framing_button(self, windows):
+        """"pause" / "resume" read from LightBurn's Live Framing window if it's
+        open (None otherwise). Uses the same remembered-box trick as scan():
+        a quick read of the button's area, and a full read of the window at
+        most once per FULL_SCAN_GAP when the button isn't where it was."""
         hwnd = next((h for h in windows
                      if "live framing" in win32gui.GetWindowText(h).lower()), None)
         if hwnd is None:
@@ -791,6 +1011,13 @@ class Detector(threading.Thread):
         return word
 
     def scan(self):
+        """One screen reading. Returns (status, note, lines, mode):
+        - status: a STATUS_WORDS word, None (can't tell) or SKIP (didn't
+          look)
+        - note: a short explanation for the banner when status is None
+        - lines: the text read, for Settings › Diagnostics
+        - mode: how it was read: "region" (quick box), "full" (whole window),
+          "wait" (skipped to keep full scans 1 s apart), "none" (no window)"""
         windows = find_lightburn_windows()
         try:
             self.file_name = lightburn_file_name(windows)
@@ -833,6 +1060,10 @@ class Detector(threading.Thread):
             status, rect = find_status(lines)
             if status:
                 if rect and rect[0] is not None:
+                    # Remember a box around the word: a little left/above it,
+                    # wide enough for the whole status line and tall enough to
+                    # also hold the Pause/Resume button row, so the next quick
+                    # reads can still tell Paused from Busy.
                     x, y, w, h = rect
                     # tall enough to include the Pause/Resume button row below
                     self.region = (hwnd, (max(0, int(x - 30)), max(0, int(y - 18)),
@@ -856,6 +1087,12 @@ class ApiDetector(Detector):
     device that has been seen connected while idle (remembered per device in
     `trusted`, a dict saved with the settings)."""
 
+    # How the API's answer becomes a status (see scan below):
+    # - job "idle": Ready, or Disconnected if the device is trusted and says it
+    #   isn't connected
+    # - job "paused": Paused
+    # - job "running": Busy or Framing; the API doesn't say which, so it's
+    #   worked out from the progress number in running_status()
     TRUST_READS = 10            # idle + connected readings in a row before trusting it
     # Framing: the API has no framing state, but (measured on a JCZ galvo with
     # LightBurn 2.2, 26 Oct) framing reports "running" with progress hovering at
@@ -890,6 +1127,9 @@ class ApiDetector(Detector):
 
     @property
     def interval(self):
+        """Seconds between checks. The setter enforces MIN_INTERVAL, so neither
+        the Settings slider nor a hand-edited settings file can flood
+        LightBurn."""
         return self._interval
 
     @interval.setter
@@ -900,6 +1140,14 @@ class ApiDetector(Detector):
         """"busy" or "framing" for a running report. While a run is still
         ambiguous it shows as Framing (never a false Running); once it's
         clearly a job, the job is dated from when it really began."""
+        # Each running reading moves through these rules (the instance variables
+        # set in __init__ remember the run so far):
+        # 1. First reading of a run: start a fresh record of it.
+        # 2. Progress dropping by more than 5 means a new phase (e.g. the galvo
+        #    goes back to framing after the job), so forget that it was
+        #    climbing.
+        # 3. Arriving at exactly 100 is noted with its time and whether it came
+        #    straight from framing values (90-99.9).
         prev = self._last_progress
         if self._run_start is None:
             self._run_start, self._run_low, self._low_since = now, False, None
@@ -938,9 +1186,19 @@ class ApiDetector(Detector):
         return "busy"
 
     def progress_from(self, lines):
+        """The API's own progress number (set by scan), not OCR text."""
         return self.api_progress
 
     def scan(self):
+        """One API reading: fetch /api/events/poll through lbapi.snapshot() and
+        map it to a status (see the overview above TRUST_READS). Returns the
+        same (status, note, lines, mode) as Detector.scan; `lines` here is a
+        readable summary of the API answer for Settings › Diagnostics.
+
+        401/403 means LightBurn no longer accepts our pairing secret (revoked
+        or reinstalled): the note tells the user to connect again. Any other
+        error while LightBurn isn't running just means "LightBurn isn't
+        open"."""
         self.api_progress = None
         try:
             self.file_name = lightburn_file_name(find_lightburn_windows(include_minimized=True))
@@ -963,6 +1221,8 @@ class ApiDetector(Detector):
         device = conn.get("device_name") or ""
         lines = [f"job: {state}", f"progress: {job.get('progress', '-')}",
                  f"connected: {connected}", f"device: {device}"]
+        # A different laser was selected in LightBurn: start counting its idle +
+        # connected readings from zero (trust is per device).
         if device != self._device:
             self._device, self._idle_connected = device, 0
         p = job.get("progress")
@@ -978,6 +1238,10 @@ class ApiDetector(Detector):
             self._run_start, self._last_progress = None, None
             if connected:
                 self._idle_connected += 1
+                # 10 idle readings in a row reporting "connected" prove this
+                # controller reports its link honestly, so from now on "not
+                # connected" really means the laser is unplugged or off.
+                # on_trust saves the trusted list to settings.
                 if self._idle_connected >= self.TRUST_READS and not self.trusted.get(device):
                     self.trusted[device] = True
                     if self.on_trust:
@@ -1003,6 +1267,10 @@ class HybridDetector(Detector):
 
     def __init__(self, ocr, out_q, interval, secret, trusted, on_trust=None):
         super().__init__(ocr, out_q, interval)
+        # The two sub-readers are ordinary Detector / ApiDetector objects whose
+        # scan() and debounce() are called from this thread's scan(); their own
+        # threads are never started. They share out_q but never put to it (only
+        # run() does that, and theirs doesn't run).
         self.screen = Detector(ocr, out_q, interval)            # not started: run from here
         self.api = ApiDetector(out_q, interval, secret, trusted, on_trust)
         self.source = None                                     # "screen" or "api" right now
@@ -1013,20 +1281,36 @@ class HybridDetector(Detector):
         self.api_progress = None
 
     def reset(self):
+        """Forget remembered screen areas in both this object and the screen
+        sub-reader."""
         super().reset()
         self.screen.reset()
 
     def _mark(self, source, status, now):
+        """Remember when a reader's raw status last changed: the raw time is the
+        earliest moment that reader saw the new state, before any confirming."""
         if self._raw.get(source) != status:
             self._raw[source], self._raw_since[source] = status, now
 
     def progress_from(self, lines):
+        """Prefer the API's progress (exact) and fall back to the screen's %."""
         return self.api_progress if self.api_progress is not None else parse_progress(lines)
 
     def debounce(self, status):
+        """No debouncing here: each sub-reader has already confirmed its own
+        status in scan()."""
         self.shown = status             # the sub-readers have already confirmed it
 
     def scan(self):
+        """Read both sources and decide what to show:
+        1. The screen reader scans and debounces (every check).
+        2. The API is asked if MIN_INTERVAL has passed since the last
+           request.
+        3. If the screen gave a confirmed status, show it; otherwise
+           (LightBurn minimised, covered by a full-screen app, OCR failing)
+           show the API's.
+        4. A new status is dated from the earliest moment either reader saw
+           it, which makes job times as accurate as the faster reader allows."""
         now = time.time()
         # Screen
         sc = self.screen
@@ -1077,6 +1361,9 @@ class HybridDetector(Detector):
 # Arduino link (background thread)
 # ===========================================================================
 def list_ports():
+    """Serial ports for the Settings dropdown as (device, description), e.g.
+    ("COM5", "USB-SERIAL CH340 (COM5)"). Bluetooth serial ports are hidden:
+    opening one can hang for many seconds."""
     if not HAVE_SERIAL:
         return []
     out = []
@@ -1088,6 +1375,9 @@ def list_ports():
 
 
 def find_arduino_port():
+    """The first port that looks like an Arduino (Auto-detect), or None. Matches
+    by name and by USB vendor ID: 2341 / 2a03 are Arduino, 1a86 is the CH340
+    chip on most Uno clones."""
     if not HAVE_SERIAL:
         return None
     for p in serial.tools.list_ports.comports():
@@ -1100,6 +1390,11 @@ def find_arduino_port():
     return None
 
 
+# The Uno sends this line every 250 ms; the ESP32 sends it as its reply to each
+# message (see the .ino sketches). temp raw is the analog reading 0-1023; the
+# app converts it to degrees for the chosen sensor type. presses counts button
+# presses since the board started, so the app can spot new presses by comparing
+# with the last value.
 def parse_inputs(line):
     """The board's sensor report "S,<fire>,<temp raw>,<door open>,<flow>,<button presses>"
     as a dict, or None."""
@@ -1114,6 +1409,17 @@ def parse_inputs(line):
             "flow": bool(flow), "presses": presses, "time": time.time()}
 
 
+# The serial / UDP protocol, one command per line (see the .ino sketches):
+#     B P R         status: Busy (running), Paused, Ready
+#     F f / D d     Framing / Disconnected; capital = blink, small = steady
+#     U             Unknown (LightBurn can't be read): all lights off
+#     K<hex>        relay bits, e.g. K0005 = RELAY_PINS[0] and [2] on
+#     A / a         app alarm on / off (buzzer)
+#     C             attention beeps (nobody at the PC during a job)
+#     X             silence the alarm, and clear a latched fire alarm once the
+#                   sensor is clear
+# The board switches the lights and relays off if no message arrives for 5 s, so
+# a crashed app or unplugged PC can't leave the red light or a relay on.
 class LinkBase(threading.Thread):
     """What the app sends every half second (and at once on a change):
     status letter, relay bits, alarm on/off, and one-off commands (chirp)."""
@@ -1132,16 +1438,22 @@ class LinkBase(threading.Thread):
         self.wake = threading.Event()      # set to send a new code right away
 
     def message(self):
+        """The full message for one send: status, relays, alarm, plus any queued
+        one-off commands (which are then cleared, so they're sent once)."""
         msg = self.code + b"\n" + b"K%04X\n" % self.relays + (b"A\n" if self.alarm else b"a\n")
         msg, self.pending = msg + self.pending, b""
         return msg
 
     def chirp(self):
+        """Queue a short beep and wake the thread so it goes out now."""
         self.pending += b"C\n"
         self.wake.set()
 
 
 class ArduinoLink(LinkBase):
+    """The USB link to an Arduino Uno (laser_stack_light.ino) at 9600 baud.
+    Sends the message every 0.5 s or immediately when woken, reads back the
+    sensor reports, and reconnects by itself if the cable is unplugged."""
     def __init__(self):
         super().__init__()
         self.port = "Auto-detect"
@@ -1150,6 +1462,10 @@ class ArduinoLink(LinkBase):
         self._buf = b""
 
     def _read_inputs(self):
+        """Read whatever the board sent (non-blocking, timeout=0) and keep the
+        newest complete sensor report. Partial lines stay in _buf until the
+        rest arrives; _buf is capped so garbage on the line can't grow it
+        forever."""
         try:
             data = self._ser.read(512)
         except Exception:
@@ -1164,6 +1480,8 @@ class ArduinoLink(LinkBase):
                 self.inputs = got
 
     def _close(self, send_off=False):
+        """Close the port. send_off first switches the light and relays off,
+        used when the user disables the Arduino or the app quits."""
         if self._ser is not None:
             try:
                 if send_off:
@@ -1175,6 +1493,11 @@ class ArduinoLink(LinkBase):
         self._ser, self._open_port, self.connected = None, None, False
 
     def run(self):
+        """Keep the link alive: pick the port (chosen, or the one auto-detect
+        found), open it if needed, send the message, read sensors, wait 0.5 s
+        or until woken. Every failure just updates `status` (shown in
+        Settings) and retries after a pause; nothing here ever raises into
+        the app."""
         while not self.stop_evt.is_set():
             if not HAVE_SERIAL:
                 self.status = "pyserial not installed"
@@ -1220,6 +1543,8 @@ class ArduinoLink(LinkBase):
 WIFI_PORT = 4210        # UDP port of the ESP32 Wi-Fi light (esp32_stack_light.ino)
 
 
+# UDP rather than TCP: no connection to keep up or time out, and a lost packet
+# doesn't matter because the full state is resent every half second.
 class NetLight(LinkBase):
     """The same messages as the USB Arduino, sent over Wi-Fi (UDP) to an ESP32.
     The board answers each message with its sensor report, which is how we
@@ -1233,6 +1558,9 @@ class NetLight(LinkBase):
         self._last_reply = 0.0
 
     def run(self):
+        """Like ArduinoLink.run, over UDP. The host name ("beacon-light.local")
+        is looked up again every minute in case the router gave the ESP32 a
+        new address. Connected = a reply came in the last 3 seconds."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(0.3)
         while not self.stop_evt.is_set():
@@ -1279,18 +1607,31 @@ class NetLight(LinkBase):
 # ===========================================================================
 # Run-time log (counts Running only, never paused, stopped or test mode)
 # ===========================================================================
+# jobs.jsonl is "JSON lines": one JSON object per line, appended as each job
+# ends, so writing never has to rewrite the whole file and a damaged line only
+# loses that one job (it's skipped on load).
 JOBS_PATH = os.path.join(CONFIG_DIR, "jobs.jsonl")
 OPEN_JOB_PATH = os.path.join(CONFIG_DIR, "open_job.json")
 META_PATH = os.path.join(CONFIG_DIR, "job_meta.json")   # later edits: customer / material
 CHECKPOINT_EVERY = 30.0
+# Labels a job can carry: LightBurn file name, customer and material (picked on
+# the main page while it runs, or edited later in Statistics).
 JOB_TAGS = ("name", "client", "material")
 
 
+# Example jobs.jsonl line (times are Unix seconds):
+#     {"start": 1730000000.0, "end": 1730000600.0, "run": 540.0,
+#      "seg": [[1730000000.0, 1730000300.0], [1730000360.0, 1730000600.0]],
+#      "name": "Coasters", "client": "Ann", "material": "Oak 3 mm"}
+# Here the job was paused for a minute: 600 s from start to end, 540 s of actual
+# laser time ("run"). Statistics only ever count "run".
 class RunLog:
     """One line per job in jobs.jsonl: {"start", "end", "run", "seg": [[s, e], ...]}
     where "seg" are the stretches the laser was actually running. The job in
     progress is checkpointed so a crash or power cut loses at most 30 s."""
 
+    # On start: load every finished job, then rescue a job that was still open
+    # when the app last stopped (crash, power cut) from open_job.json.
     def __init__(self):
         self.jobs = []
         self.job = None              # job in progress
@@ -1325,6 +1666,9 @@ class RunLog:
         self._apply_meta()
 
     def _apply_meta(self):
+        """Copy later edits (job_meta.json, keyed by the job's start time) onto
+        the loaded jobs. Edits are kept in their own file so jobs.jsonl is
+        only ever appended to, never rewritten."""
         for j in self.jobs:
             j.update(self.meta.get(str(j["start"]), {}))
 
@@ -1345,6 +1689,10 @@ class RunLog:
         A job starts when the laser starts running and ends at Ready,
         Framing or Disconnected; Paused and "can't see" only stop the clock.
         tags: {"name", "client", "material"} recorded when a job starts."""
+        # Called on every status the UI shows (several times a second). A job is
+        # a list of running stretches ("segments"): Busy opens a segment,
+        # anything else closes it, and Ready/Framing/Disconnected close the
+        # whole job.
         now = now or time.time()
         if status == "busy":
             if self.job is None:
@@ -1358,6 +1706,8 @@ class RunLog:
             self.close(now)
 
     def close(self, now=None):
+        """End the job in progress (if any) and save it. Jobs with no running
+        time at all (e.g. started and stopped while paused) are not saved."""
         now = now or time.time()
         if self.job is None:
             return
@@ -1370,6 +1720,10 @@ class RunLog:
         self._remove_open()
 
     def checkpoint(self, now=None):
+        """Save the job in progress to open_job.json, at most every
+        CHECKPOINT_EVERY seconds. Called from the UI's poll loop; if the app
+        dies, the next start finds this file and keeps the job (see
+        __init__)."""
         now = now or time.time()
         if self.job is None or now - self._last_checkpoint < CHECKPOINT_EVERY:
             return
@@ -1391,6 +1745,7 @@ class RunLog:
         return self._snapshot(job, now)
 
     def all_jobs(self, now):
+        """Saved jobs plus the one in progress (as it stands now)."""
         cur = self.current(now)
         return self.jobs + ([cur] if cur else [])
 
@@ -1418,11 +1773,15 @@ class RunLog:
         return self._day_cache[1] + (overlap(cur["seg"]) if cur else 0.0)
 
     def session_run_time(self, now):
+        """Running seconds since the app was opened, including the stretch in
+        progress (a job already running at launch only counts from the
+        launch)."""
         open_part = (now - max(self.seg_start, self.session_start)
                      if self.seg_start is not None else 0.0)
         return self.session_run + open_part
 
     def _close_segment(self, now):
+        """End the running stretch in progress and add it to the job."""
         self.job["seg"].append([round(self.seg_start, 1), round(now, 1)])
         self.session_run += now - max(self.seg_start, self.session_start)
         self.seg_start = None
@@ -1441,12 +1800,15 @@ class RunLog:
 
     @staticmethod
     def _snapshot(job, now):
+        """The job dict as saved: start, end (now), total run time from the
+        segments, the segments, and any tags that are set."""
         snap = {"start": job["start"], "end": round(now, 1),
                 "run": round(sum(e - s for s, e in job["seg"]), 1), "seg": job["seg"]}
         snap.update({k: job[k] for k in JOB_TAGS if job.get(k)})
         return snap
 
     def _append(self, job):
+        """Keep a finished job in memory and add it as one line to jobs.jsonl."""
         self.jobs.append(job)
         try:
             os.makedirs(CONFIG_DIR, exist_ok=True)
@@ -1456,6 +1818,7 @@ class RunLog:
             pass
 
     def _remove_open(self):
+        """Delete open_job.json (no job is open any more)."""
         try:
             os.remove(OPEN_JOB_PATH)
         except OSError:
@@ -1479,6 +1842,9 @@ def hourly_buckets(segments):
 # ===========================================================================
 # Look & feel
 # ===========================================================================
+# Colours. A pair is (light theme, dark theme): CustomTkinter widgets accept
+# pairs directly and switch with the theme; plain Tk widgets and Pillow need a
+# single colour, which pick() chooses for the current theme.
 BG = ("#F4F5F7", "#0E1014")
 CARD = ("#FFFFFF", "#171A21")
 CARD_BORDER = ("#E5E7EB", "#232733")
@@ -1486,6 +1852,7 @@ TEXT = ("#0F172A", "#F1F5F9")
 MUTED = ("#6B7280", "#8B93A3")
 ACCENT = ("#2563EB", "#3B82F6")
 
+# Status colours, the same in both themes.
 RED = "#EF4444"
 GREEN = "#22C55E"
 AMBER = "#F59E0B"
@@ -1519,6 +1886,7 @@ FONT = "Segoe UI"
 
 
 def pick(pair):
+    """The colour of a (light, dark) pair for the current theme."""
     return pair[1] if ctk.get_appearance_mode() == "Dark" else pair[0]
 
 
@@ -1527,27 +1895,37 @@ def pick(pair):
 # name; part of Windows, driven through pywin32). The older MCI player is the
 # fallback; on some PCs it plays WAV but fails on MP3 ("error 277").
 # ===========================================================================
+# A chosen sound is copied into SOUNDS_DIR, so the chime keeps working if the
+# original file is moved or deleted. WMP_PLAYING is Media Player's playState
+# value for "playing".
 SOUNDS_DIR = os.path.join(CONFIG_DIR, "sounds")
 SOUND_TYPES = [("Sound files", "*.mp3 *.wav *.wma *.m4a"), ("All files", "*.*")]
 WMP_PLAYING = 3
 
 
 def _mci(command):
+    """Send one command string to Windows' old MCI multimedia player. 0 = OK."""
     return ctypes.windll.winmm.mciSendStringW(command, None, 0, 0)
 
 
 def _mci_play(path):
+    """Play a file with MCI under the alias "lschime" (closing the previous one
+    first). True if it started."""
     _mci("close lschime")
     return (_mci(f'open "{path}" type mpegvideo alias lschime') == 0
             and _mci("play lschime") == 0)
 
 
 class ChimePlayer:
+    """Plays the job-finished sound without blocking the UI. The Windows Media
+    Player COM object is created on first use (it takes a moment); if it
+    can't be created, the MCI player is used instead."""
     def __init__(self):
         self._wmp = None            # created on first use; False if unavailable
         self._errors_before = 0     # Media Player's error count when play started
 
     def _player(self):
+        """The Media Player COM object, or None if this PC doesn't have it."""
         if self._wmp is None:
             try:
                 import pythoncom
@@ -1600,6 +1978,7 @@ class ChimePlayer:
         return _mci_play(path)          # last try with the older player
 
     def stop(self):
+        """Stop whatever is playing, in both players."""
         _mci("close lschime")
         if self._wmp:
             try:
@@ -1608,6 +1987,7 @@ class ChimePlayer:
                 pass
 
 
+# One shared player for the whole app, plus short helpers used by the UI.
 CHIME = ChimePlayer()
 
 
@@ -1646,10 +2026,12 @@ def rounded_path(x0, y0, x1, y1, r, step):
     pts = []
 
     def line(ax, ay, bx, by):
+        """Points along a straight edge, about `step` apart."""
         n = max(1, int(math.hypot(bx - ax, by - ay) / step))
         pts.extend((ax + (bx - ax) * i / n, ay + (by - ay) * i / n) for i in range(n))
 
     def arc(cx, cy, a0):
+        """Points along a quarter circle round (cx, cy), starting at angle a0."""
         n = max(2, int(math.pi / 2 * r / step))
         pts.extend((cx + r * math.cos(a0 + math.pi / 2 * i / n),
                     cy + r * math.sin(a0 + math.pi / 2 * i / n)) for i in range(n))
@@ -1689,6 +2071,9 @@ def panel_image(w, h, r, fill, outline, width, dash, behind, hard_edge=False):
     hard_edge: for see-through windows. Windows can't blend an edge with what's
     behind the window, so outer edge pixels are either fully panel (in its own
     edge colour) or fully `behind`; never a half-mix that shows as a dark rim."""
+    # Supersampling: draw at S times the size and shrink, so curves and lines
+    # get smooth (anti-aliased) edges that Pillow's drawing doesn't do by
+    # itself.
     S = 2 if w * h > 60000 else 3
     W, H, R, lw = w * S, h * S, r * S, max(1, round(width * S))
     edge = (fill if dash else outline) if hard_edge else behind
@@ -1729,6 +2114,8 @@ class RoundPanel(tk.Canvas):
         self._img = self._drawn = self._pending = None
         self.bind("<Configure>", lambda e: self._schedule())
 
+    # The main window's status card uses this to show the status colour as its
+    # border (dashed while blinking statuses like Framing are on).
     def set_style(self, color, width, dash=None):
         """width in logical px; dash = (on, off) in logical px, or None for solid."""
         self.style = (color, width, dash)
@@ -1746,6 +2133,10 @@ class RoundPanel(tk.Canvas):
             self._pending = self.after(15, self.redraw)
 
     def redraw(self):
+        """Draw the panel at its current size and style. The picture is skipped
+        if nothing changed, reused from the cache if this exact look was
+        drawn recently, and otherwise rendered by panel_image(). It's kept at
+        the bottom of the canvas (tag_lower) so child widgets stay on top."""
         self._pending = None
         w, h = self.winfo_width(), self.winfo_height()
         if w < 8 or h < 8:
@@ -1774,6 +2165,8 @@ class RoundPanel(tk.Canvas):
 
 
 def blend(c1, c2, t):
+    """Mix two "#rrggbb" colours: t=0 gives c1, t=1 gives c2. Used for fades
+    (e.g. the blinking dot)."""
     a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
     b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
     return "#" + "".join(f"{round(a[i] + (b[i] - a[i]) * t):02x}" for i in range(3))
@@ -1782,6 +2175,8 @@ def blend(c1, c2, t):
 # ===========================================================================
 # Notifications: Windows pop-ups and a Telegram bot
 # ===========================================================================
+# Events the user can switch on in Settings › Notifications, as (key, label).
+# The key is used in settings ("notify_<key>") and when sending.
 NOTIFY_EVENTS = [("finished", "A job finishes"), ("paused", "A job is paused"),
                  ("lost", "The laser disconnects mid-job"), ("started", "A job starts"),
                  ("stuck", "A job runs too long or stays paused"),
@@ -1795,6 +2190,8 @@ SAFETY_EVENTS = {"fire", "temp", "flow", "door"}
 
 
 def cost_per_hour(c):
+    """What one hour of laser time costs from the Statistics › Costs inputs:
+    electricity + machine wear + maintenance + labour + other."""
     wear = c["machine_price"] / c["lifetime_h"] if c["lifetime_h"] > 0 else 0.0
     return c["power_kw"] * c["kwh_price"] + wear + c["maint_h"] + c["labor_h"] + c["other_h"]
 
@@ -1805,6 +2202,9 @@ def telegram_call(token, method, params=None, timeout=10):
     import urllib.error
     import urllib.parse
     import urllib.request
+    # Plain urllib (no extra package): the Bot API takes form-encoded POSTs.
+    # Telegram explains errors in JSON even on HTTP errors, so that's read too
+    # and turned into a message a user can act on.
     url = f"https://api.telegram.org/bot{token}/{method}"
     data = urllib.parse.urlencode(params or {}).encode("utf-8")
     try:
@@ -1827,11 +2227,15 @@ def telegram_call(token, method, params=None, timeout=10):
     return reply.get("result")
 
 
+# Usage reports (hourly / daily / weekly) sent to Telegram or as pop-ups. The
+# App's report timer decides when; build_report() writes the text.
 REPORT_SPAN = {"hourly": 3600, "daily": 86400, "weekly": 7 * 86400}
 WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
 
 def _change_line(cur, prev, what):
+    """"vs the week before: ▲ 12%" comparing this period with the one before, or
+    "" when there's nothing to say."""
     if prev <= 0:
         return f"vs {what}: no laser time then" if cur > 0 else ""
     pct = (cur - prev) / prev * 100
@@ -1849,6 +2253,11 @@ def build_report(kind, end, runlog, costs, now=None):
     run = runlog.run_between(start_ts, end_ts, now)
     prev = runlog.run_between(start_ts - span, start_ts, now)
     jobs = runlog.jobs_between(start_ts, end_ts, now)
+    # Example daily report body:
+    #     Laser on: 3h 12m
+    #     Jobs: 14  ·  longest 41m 3s
+    #     Cost: $4.80
+    #     vs the 24 h before: ▲ 18%
     lines = []
     if kind == "hourly":
         title = f"⏱ Hourly report · {start:%H:%M}–{end:%H:%M}"
@@ -1891,6 +2300,7 @@ def bars_icon(color):
 
 
 def fmt_duration(sec):
+    """Clock style: "4:05" -> "04:05", or "1:02:03" with hours."""
     sec = int(sec)
     h, rem = divmod(sec, 3600)
     m, s = divmod(rem, 60)
@@ -1900,6 +2310,7 @@ def fmt_duration(sec):
 
 
 def fmt_human(sec):
+    """Short words: "45s", "3m 20s", "2h 5m"."""
     sec = int(sec)
     m, s = divmod(sec, 60)
     h, m = divmod(m, 60)
@@ -1913,8 +2324,26 @@ def fmt_human(sec):
 # ===========================================================================
 # The app
 # ===========================================================================
+# The whole user interface and the glue between the parts. One App object is
+# created by main(); it owns:
+# - the Tk window (self.root) with its pages: Home (live status), Statistics,
+#   Settings, Help, the setup assistant ("wizard"), Diagnostics. Most pages are
+#   built the first time they're shown (see ensure_page / LAZY_PAGES), so the
+#   window opens quickly.
+# - the compact "pill" window, the tray icon and the global hotkey
+# - the background workers: the detector thread (Detector / ApiDetector /
+#   HybridDetector), the Arduino and Wi-Fi light links, the phone dashboard
+#   server, notification sending
+# - the job bookkeeping (RunLog) and statistics
+#
+# Threads never touch Tk widgets: they put messages on queues, and poll() on the
+# UI thread empties those queues every few milliseconds (Tk isn't thread-safe).
+# Settings are in self.s (a dict) and saved with save().
 class App:
     def __init__(self, ocr):
+        # Window setup. The window starts fully transparent (alpha 0) and is
+        # revealed once everything is drawn, so the user never sees it
+        # half-built.
         self.s = load_settings()
         ctk.set_appearance_mode(self.s["appearance"].lower())
         ctk.set_default_color_theme("blue")
@@ -1938,6 +2367,8 @@ class App:
             self.scale = 1.0
 
         # runtime state
+        # self.q receives the detector's messages (see Detector.run); poll()
+        # reads them. The rest is what the UI remembers between those messages.
         self.q = queue.Queue()
         self.state = None
         self.last_msg = {"note": "Starting...", "lines": [], "mode": ""}
@@ -1950,6 +2381,9 @@ class App:
         self.test_mode = False      # statuses come from the Test buttons, not LightBurn
         self.demo_after = None
         self.demo_end = None
+        # Per relay (index = position in RELAY_PINS): a manual override from
+        # pressing its button, whether the automatic rule wants it on, and the
+        # timing needed for "keep on after" and "switch on after a delay".
         n = len(RELAY_PINS)
         self.relay_override = [None] * n    # manual press, kept until the auto rule changes
         self.relay_auto = [False] * n
@@ -1979,12 +2413,23 @@ class App:
         self.last_presses = None
         self.app_alarm = False
         self.maint_alerted = set()
+        # Flood guard: if the same alert fires more than 3 times in 60 s, one
+        # warning is sent and that alert is paused for 10 minutes (never for
+        # SAFETY_EVENTS).
         self._alerts_sent, self._alerts_paused = {}, {}     # notify() flood guard
         self._end_pending = None        # a job that stopped but isn't finished yet
         self._resume_pending = None     # Paused -> Running not yet confirmed as a resume
+        # Python's automatic garbage collector can run on whichever thread
+        # happens to allocate. If it runs on a worker thread while freeing Tk
+        # objects, Tk crashes (Tk objects must only be touched from the UI
+        # thread). So automatic collection is off and poll() collects on the UI
+        # thread at set times.
         gc.disable()                    # collected on the UI thread in poll()
         self._gc_at = self._gc_full_at = time.time()
 
+        # Start the workers. Each runs in its own thread and is told what to do
+        # by setting attributes (enabled, port, host...) from the UI thread;
+        # they only read those, so no locks are needed.
         self.ocr = ocr
         self.ocr_name = ocr.name if ocr else "unavailable"
         if not isinstance(self.s.get("lb_api_trusted"), dict):
@@ -2003,6 +2448,11 @@ class App:
         self.checklog = DetectionLog(os.path.join(CONFIG_DIR, "detection-check"))
         self.checklog.enabled = bool(self.s["check_log"])
         self._dash_snapshot = {}
+        # The tray icon and the global hotkey use a hidden Win32 window whose
+        # messages Tk's own loop dispatches. Its window procedure runs in the
+        # middle of that dispatch, where touching Tk crashes Python, so its
+        # callbacks are handed over with post=self._on_ui and run on the next
+        # poll() (see beacon/winsys.py).
         self.tray = winsys.TrayHost(APP_NAME, ICON_PATH,
                                     on_menu=lambda x, y: self.show_tray_menu(x, y),
                                     on_open=self.bring_to_front_full, on_hotkey=self.hotkey_pressed,
@@ -2031,6 +2481,9 @@ class App:
         # task tools): any of them quits the whole app properly
         for win in (self.root, self.pill, self.pill_menu):
             win.protocol("WM_DELETE_WINDOW", self.quit)
+        # Two timers keep the UI alive: poll() (fast: detector messages, links,
+        # alerts) and tick() (once a second: clocks, timers). Both reschedule
+        # themselves with root.after().
         self.poll()
         self.tick()
         self._mark_reports_sent()           # reports switched on but never sent: start fresh
@@ -2051,14 +2504,21 @@ class App:
 
     # -------------------------------------------------------------- layout
     def font(self, size, weight="normal"):
+        """The app's font (Segoe UI) at a size in points."""
         return ctk.CTkFont(family=FONT, size=size, weight=weight)
 
     def icon_button(self, master, text, command):
+        """A small square, borderless button showing one symbol (the ⚙ ? ↘ in
+        the header)."""
         return ctk.CTkButton(master, text=text, width=34, height=34, corner_radius=10,
                              fg_color="transparent", hover_color=CARD_BORDER,
                              text_color=MUTED, font=self.font(16), command=command)
 
     def build_status_page(self):
+        """Build the Home page: header with the page buttons, the banners (test
+        mode, can't read LightBurn, alarm; only packed when needed), the
+        status card with the big coloured orb and status text, the relay
+        buttons, and the footer (last check, Arduino connection)."""
         p = self.status_page = ctk.CTkFrame(self.root, fg_color="transparent")
 
         head = ctk.CTkFrame(p, fg_color="transparent")
@@ -2139,6 +2599,9 @@ class App:
 
     # ------------------------------------------- Settings categories and order
     # Order on a fresh install (no saved order); people can rearrange it.
+    # Each key names one category created with section(body, title, key) in
+    # build_settings_page(). The order the user chooses is saved as a list of
+    # these keys in settings["settings_order"].
     SETTINGS_ORDER = ["detection", "arduino", "relays", "telegram", "notifications",
                       "display", "reports", "windows", "shop", "test", "help",
                       "diagnostics", "check"]
@@ -2205,6 +2668,8 @@ class App:
                 w.bind("<Button-1>", lambda e, k=key: self.open_category(k))
 
     def move_section(self, key, step):
+        """Move a category one place up (step=-1) or down (step=1) in the list
+        and save the new order (the ▲ ▼ buttons)."""
         order = self.settings_order()
         i = order.index(key)
         j = i + step
@@ -2216,6 +2681,7 @@ class App:
         self.apply_settings_order()
 
     def reset_settings_order(self):
+        """Back to the default order (SETTINGS_ORDER)."""
         self.s["settings_order"] = []
         save_settings(self.s)
         self.apply_settings_order()
@@ -2232,11 +2698,14 @@ class App:
         self.settings_body._parent_canvas.yview_moveto(0)
 
     def show_category_list(self):
+        """Back from one category to the list of categories."""
         self.settings_cat_view.pack_forget()
         self.settings_list_view.pack(fill="both", expand=True)
         self.settings_category = None
 
     def row(self, box, label, sub=None):
+        """A settings row: a label (and optional grey explanation) on the left.
+        Returns the row frame so the caller can pack a control on its right."""
         r = ctk.CTkFrame(box, fg_color="transparent")
         r.pack(fill="x", padx=14, pady=8)
         txt = ctk.CTkFrame(r, fg_color="transparent")
@@ -2249,6 +2718,7 @@ class App:
         return r
 
     def note(self, box, text, pady=(0, 8)):
+        """A paragraph of small grey explanatory text inside a card."""
         lbl = ctk.CTkLabel(box, text=text, font=self.font(11), text_color=MUTED, anchor="w",
                            justify="left", wraplength=300)
         lbl.pack(fill="x", padx=14, pady=pady)
@@ -2294,6 +2764,7 @@ class App:
         return var
 
     def open_row(self, box, label, sub, page, button="Open"):
+        """A row with an "Open ›" button that goes to another page."""
         r = self.row(box, label, sub)
         ctk.CTkButton(r, text=button + "  ›", width=90, height=30, corner_radius=10,
                       fg_color="transparent", hover_color=CARD_BORDER, text_color=ACCENT,
@@ -2302,6 +2773,7 @@ class App:
         return r
 
     def action_button(self, master, text, command, width=120):
+        """An outlined secondary button (Connect, Forget, Send test...)."""
         return ctk.CTkButton(master, text=text, width=width, height=30, corner_radius=8,
                              fg_color="transparent", border_width=1, border_color=CARD_BORDER,
                              hover_color=CARD_BORDER, text_color=ACCENT,
@@ -2323,6 +2795,9 @@ class App:
         return p, body
 
     def switch_row(self, box, key, label, sub, on_change=None):
+        """An on/off switch bound to the boolean setting `key`: saved as soon as
+        it's flipped. Forces the orb and pill to redraw, since several
+        switches change how they look."""
         r = self.row(box, label, sub)
         var = ctk.BooleanVar(value=bool(self.s[key]))
 
@@ -2343,6 +2818,8 @@ class App:
         self.settings_category = None
 
         def header(parent, back_text, back, title):
+            """"← Back" on the left, a title on the right. Returns the title
+            label so the category view can change it."""
             head = ctk.CTkFrame(parent, fg_color="transparent")
             head.pack(fill="x", padx=18, pady=(16, 0))
             ctk.CTkButton(head, text="\u2190  " + back_text, width=80, height=32,
@@ -2373,6 +2850,9 @@ class App:
 
         # Categories are built in any order; apply_settings_order() lists them.
         # --- Display
+        # Every category below follows the same pattern: box = self.section(...)
+        # for the card, then rows built with the helpers above. Each control
+        # saves its setting the moment it changes; there is no Save button.
         box = self.section(body, "Display", "display")
         self.switch_row(box, "blink", "Blink for Framing / Disconnected",
                         "Off keeps every state steady")
@@ -2526,12 +3006,16 @@ class App:
         hours = [f"{h:02d}:00" for h in range(24)]
 
         def report_row(kind, label, sub):
+            """An on/off switch for one report kind (hourly / daily / weekly)."""
             r = self.row(box, label, sub)
             var = ctk.BooleanVar(value=bool(self.s[f"report_{kind}"]))
             ctk.CTkSwitch(r, text="", variable=var, onvalue=True, offvalue=False, width=46,
                           command=lambda: self._report_toggled(kind, var)).pack(side="right")
 
         def time_line(parts):
+            """A line of words and dropdowns under a report switch, e.g. "on
+            [Sunday] at [18:00]". parts: (kind, "text") or (kind, (setting
+            key, choices, current choice, text -> value))."""
             line = ctk.CTkFrame(box, fg_color="transparent")
             line.pack(fill="x", padx=14, pady=(0, 6))
             for kind, item in parts:
@@ -2583,6 +3067,9 @@ class App:
         self.report_status.pack(fill="x", padx=14, pady=(4, 12))
 
         # --- Arduino
+        # The port list is filled by refresh_ports(); port_status shows the
+        # link's live status (Connected on COM5 / No Arduino found...), updated
+        # in poll().
         box = self.section(body, "Arduino light", "arduino")
         self.switch_row(box, "arduino", "Send status to Arduino",
                         "Red = running, green = stopped",
@@ -2628,6 +3115,10 @@ class App:
                        (0, 5, 10, 15, 20, 25, 30, 40, 50, 60)}, width=100)
 
         # --- Test mode
+        # Test mode replaces LightBurn as the source of statuses: the buttons
+        # below set a status by hand, and the 10 s test job runs Running ->
+        # Ready by itself. Test jobs are never counted in statistics (see
+        # RunLog.observe).
         box = self.section(body, "Test mode", "test")
         r = self.row(box, "Simulate LightBurn",
                      "Fake a status to try the app and Arduino light without the laser")
@@ -2694,6 +3185,8 @@ class App:
         self.check_status = self.note(box, "", pady=(4, 10))
         self.update_check_summary()
 
+        # Under the category list: Reset order, and the version / OCR engine /
+        # settings folder for support questions.
         foot = self.settings_footer = ctk.CTkFrame(lbody, fg_color="transparent")
         foot.pack(pady=(14, 4))
         ctk.CTkButton(foot, text="Reset order", width=140, height=24, corner_radius=8,
@@ -2705,6 +3198,9 @@ class App:
         self.apply_settings_order()
 
     def build_relays_page(self):
+        """Build the Relay buttons page (header plus a scrolling body); the body
+        itself is filled by rebuild_relays_page(), which runs again whenever
+        a relay is added or removed."""
         p = self.relays_page = ctk.CTkFrame(self.root, fg_color="transparent")
         head = ctk.CTkFrame(p, fg_color="transparent")
         head.pack(fill="x", padx=18, pady=(16, 0))
@@ -2722,6 +3218,10 @@ class App:
         self.rebuild_relays_page()
 
     def rebuild_relays_page(self):
+        """Fill the Relay buttons page: one card per relay in use (name,
+        automatic rule, keep-on time, switch-on delay, schedule, and which
+        device it switches), a Home Assistant card when any relay uses it,
+        and "Add a button" with the pins still free."""
         if not hasattr(self, "relays_body"):    # not opened yet: built fresh when it is
             return
         body = self.relays_body
@@ -2772,6 +3272,9 @@ class App:
             keep.pack(side="right")
 
             def menu(parent, options, current, key, i=i, width=110, rebuild=False):
+                """A dropdown for relay i's setting `key`. options: {stored
+                value: shown text}. rebuild=True redraws the page after a
+                change (choosing a smart plug adds an address field)."""
                 back = {t: v for v, t in options.items()}
 
                 def changed(text):
@@ -2852,6 +3355,8 @@ class App:
                          font=self.font(12), text_color=MUTED).pack(padx=12, pady=12)
 
     def add_relay(self):
+        """Turn on the relay for the pin picked in "Add a button" (the page is
+        rebuilt by set_relay) and scroll its new card into view."""
         i = RELAY_PINS.index(self.add_pin.get())
         self.set_relay(i, "use", True)
 
@@ -2865,6 +3370,14 @@ class App:
         self.root.after(50, scroll_to_new)
 
     def build_pill(self):
+        """Build the compact "pill": a small borderless always-on-top window
+        with a coloured dot, the status word and (during a job) its timer.
+
+        It's see-through round its rounded ends: the window's background is
+        KEY_COLOR, which Windows is told to make transparent
+        (set_window_key), and the RoundPanel inside draws the pill shape with
+        hard edges against it. Drag it to move it, double-click to go back to
+        the full window, right-click for its menu."""
         s = self.scale
         self.pill = tk.Toplevel(self.root)
         self.pill.withdraw()
@@ -2900,6 +3413,9 @@ class App:
         self.build_pill_menu()
 
         def bind_all(widget):
+            """Give the window and every widget inside it the same mouse
+            bindings, so the pill can be dragged or right-clicked anywhere on
+            it."""
             widget.bind("<ButtonPress-1>", self._pill_press, add="+")
             widget.bind("<B1-Motion>", self._pill_drag, add="+")
             widget.bind("<Double-Button-1>", lambda e: self.leave_compact(), add="+")
@@ -2925,10 +3441,14 @@ class App:
         m.bind("<Escape>", lambda e: self.hide_pill_menu())
 
     def _mute_item(self):
+        """The menu's Mute / Unmute item, depending on the current state."""
         return (("Unmute", self.unmute) if self.muted()
                 else ("Mute for 1 hour", lambda: self.mute(3600)))
 
     def popup_menu(self, x, y, items, above=False):
+        """Show the app's own popup menu at screen position (x, y). items:
+        [(text, command), ...]. above=True opens it up and to the left of the
+        point, which is where there's room next to the tray icon."""
         box = self.pill_menu_box
         for w in box.winfo_children():
             w.destroy()
@@ -2956,18 +3476,24 @@ class App:
             10, lambda: self.ask_true_status(x, y, above)))]
 
     def show_pill_menu(self, e):
+        """Right-click menu of the pill."""
         self.popup_menu(e.x_root, e.y_root, [("Expand", self.leave_compact),
                                              ("Minimize", self.minimize_pill),
                                              *self._check_items(e.x_root, e.y_root),
                                              self._mute_item(), ("Quit", self.quit)])
 
     def show_tray_menu(self, x, y):
+        """Right-click menu of the tray icon (called on the UI thread via
+        _on_ui)."""
         self.popup_menu(x, y, [("Show window", self.bring_to_front_full),
                                ("Compact pill", self.enter_compact),
                                *self._check_items(x, y, above=True),
                                self._mute_item(), ("Quit", self.quit)], above=True)
 
     # ------------------------------------------------------ detection check
+    # The opt-in detection check (beacon/detectlog.py) measures how often the
+    # status shown was wrong. The user reports a wrong status from the pill or
+    # tray menu; these are the choices offered as "what it really was".
     TRUE_STATES = (("Running", "busy"), ("Paused", "paused"), ("Ready (idle)", "ready"),
                    ("Framing", "framing"), ("Disconnected", "disconnected"))
 
@@ -2980,18 +3506,22 @@ class App:
         self.popup_menu(x, y, items, above=above)
 
     def report_wrong(self, truth):
+        """Log that the status shown was wrong and what it really was."""
         self.checklog.report(truth)
         self.update_check_summary()
         if hasattr(self, "check_status"):
             self.check_status.configure(text="Report saved ✓  Thank you.")
 
     def _check_changed(self):
+        """The "Log detection accuracy" switch was flipped."""
         self.checklog.enabled = bool(self.s["check_log"])
         if self.checklog.enabled:
             self.checklog.save()
         self.update_check_summary()
 
     def update_check_summary(self):
+        """Refresh the detection check's counts shown in Settings (only touches
+        the label when the text actually changed, as this runs often)."""
         if not hasattr(self, "check_summary"):
             return
         text = (self.checklog.summary_text() if self.checklog.enabled or
@@ -3000,10 +3530,14 @@ class App:
             self.check_summary.configure(text=text)
 
     def report_wrong_from_settings(self):
+        """The "Status is wrong…" button in Settings: open the question menu
+        just under the button."""
         b = self.check_report_btn
         self.ask_true_status(b.winfo_rootx(), b.winfo_rooty() + b.winfo_height())
 
     def export_check(self):
+        """Save the detection check log, its pictures and some debug info as one
+        zip file the user can send in."""
         path = filedialog.asksaveasfilename(
             parent=self.root, defaultextension=".zip",
             initialfile=f"{APP_NAME}-detection-check-{date.today():%Y%m%d}.zip",
@@ -3019,10 +3553,13 @@ class App:
                                     if SUPPORT_EMAIL else "Saved. Send the zip to the seller.")
 
     def open_check_folder(self):
+        """Open the detection check folder in Explorer."""
         os.makedirs(self.checklog.folder, exist_ok=True)
         os.startfile(self.checklog.folder)
 
     def reset_check(self):
+        """Delete the detection check log after asking, and start counting
+        again."""
         if messagebox.askyesno(APP_NAME, "Delete the detection check log and pictures, and "
                                          "start counting again?", parent=self.root):
             self.checklog.reset()
@@ -3030,6 +3567,7 @@ class App:
             self.check_status.configure(text="Started again.")
 
     def hide_pill_menu(self):
+        """Close the popup menu."""
         self.pill_menu.withdraw()
 
     def _menu_focus_check(self):
@@ -3042,6 +3580,9 @@ class App:
             self.hide_pill_menu()
 
     # ------------------------------------------------------------ actions
+    # Pages built on first use: page name -> the method that builds it. Building
+    # every page at startup took about 5 seconds; this way the window opens in
+    # well under a second and each page costs its time only when first opened.
     LAZY_PAGES = {"settings": "build_settings_page", "relays": "build_relays_page",
                   "stats": "build_stats_page", "help": "build_help_page",
                   "wizard": "build_wizard_page", "channels": "build_subpages",
@@ -3057,6 +3598,9 @@ class App:
             getattr(self, self.LAZY_PAGES[name])()
 
     def show_page(self, name):
+        """Switch the main window to a page: build it if needed, hide all
+        others, show it. Statistics is wider, so the window is resized when
+        entering or leaving it, and its live refresh is started or stopped."""
         self.ensure_page(name)
         prev, self.page = self.page, name
         pages = {k: getattr(self, f"{k}_page") for k in
@@ -3074,6 +3618,9 @@ class App:
             self.stats.stop()
 
     def choose_chime(self):
+        """Let the user pick a sound file for the job-finished chime. The file
+        is copied into SOUNDS_DIR, test-played (if Windows can't play it, the
+        old sound is kept) and switched on."""
         path = filedialog.askopenfilename(parent=self.root, title="Choose a chime sound",
                                           filetypes=SOUND_TYPES)
         if not path:
@@ -3101,6 +3648,8 @@ class App:
         self.show_chime_name()
 
     def reset_chime(self):
+        """The ✕ button: forget the chosen sound and go back to the Windows
+        chime."""
         stop_sound()
         self._remove_sounds(keep=None)
         self.s["chime_file"] = ""
@@ -3108,6 +3657,8 @@ class App:
         self.show_chime_name()
 
     def _remove_sounds(self, keep):
+        """Delete old copies in SOUNDS_DIR except `keep`, so only the sound in
+        use stays on disk."""
         try:
             for name in os.listdir(SOUNDS_DIR):
                 f = os.path.join(SOUNDS_DIR, name)
@@ -3117,6 +3668,7 @@ class App:
             pass
 
     def show_chime_name(self):
+        """Show which sound is chosen under the chime row."""
         f = self.s["chime_file"]
         custom = bool(f) and os.path.exists(f)
         self.chime_name.configure(text="\u266a  " + os.path.basename(f) if custom
@@ -3125,26 +3677,41 @@ class App:
 
     # ------------------------------------------------------- notifications
     def _set_text_setting(self, key, var):
+        """Save a text box's contents (trimmed) as setting `key`."""
         self.s[key] = var.get().strip()
         save_settings(self.s)
 
     def _set_flag(self, key, var):
+        """Save a checkbox as a boolean setting."""
         self.s[key] = bool(var.get())
         save_settings(self.s)
 
     def _on_ui(self, fn):
         """Run fn on the window's thread (background threads can't touch widgets)."""
+        # The detector's queue doubles as a "please run this" queue: poll() runs
+        # any {"cmd": "call"} message on the UI thread. Every background thread
+        # (Telegram, pairing, dashboard), and the tray icon's window procedure,
+        # use this to update the UI.
         self.q.put({"cmd": "call", "fn": fn})
 
     def _tg_status(self, text, ok=True):
+        """Show a line under the Telegram settings, from any thread."""
         self._on_ui(lambda: self.tg_status.configure(text=text, text_color=MUTED if ok else RED))
 
     def _pc_notify_changed(self):
+        """Windows notifications switched on: show one straight away, so the
+        user sees what they look like and Windows asks any permission now."""
         if self.s["notify_pc"]:
             self.tray.show(APP_NAME, "Notifications are on. You'll get a pop-up here when a "
                                      "job finishes.")
 
     def tg_find_chat(self):
+        """The Telegram "Find" button: fill in the Chat ID automatically.
+
+        A bot can't message someone first; once you message it, Telegram
+        keeps that message for the bot to fetch with getUpdates. The chat id
+        of the latest message is the chat to send notifications to. Runs on a
+        thread so the window doesn't freeze while Telegram answers."""
         token = self.s["tg_token"]
         if not token:
             self.tg_status.configure(text="Paste your bot token first.", text_color=RED)
@@ -3152,6 +3719,8 @@ class App:
         self.tg_status.configure(text="Asking Telegram…", text_color=MUTED)
 
         def work():
+            """Ask Telegram for the bot's name and its recent messages, then
+            fill in the chat (on the UI thread)."""
             try:
                 bot = telegram_call(token, "getMe")
                 updates = telegram_call(token, "getUpdates", {"limit": 50, "timeout": 0})
@@ -3177,6 +3746,8 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def send_test_notification(self):
+        """The "Send test" button: one test message to Windows and/or Telegram,
+        with the result shown under the button."""
         sent = []
         if self.s["notify_pc"]:
             self.tray.show(f"\U0001F514 {APP_NAME} test", "Windows notifications are working.")
@@ -3205,6 +3776,9 @@ class App:
     def notify(self, event, title, body, photo=False):
         """Send one event to every channel that's on. Ticked events only, except
         safety alarms, which always go (their sensor being on is the opt-in)."""
+        # Order of the checks: is this event ticked in Settings? (CRITICAL ones
+        # skip mute and quiet hours) -> flood guard (not for safety alarms) ->
+        # deliver. Every alert is logged so problems can be traced afterwards.
         critical = event in CRITICAL_EVENTS
         if event in dict(NOTIFY_EVENTS) and not self.s.get(f"notify_{event}"):
             return
@@ -3221,6 +3795,9 @@ class App:
         logging.info("notify %s: %s", event, title)
         self.deliver(title, body, critical=critical, photo=photo)
 
+    # More than FLOOD_COUNT of one alert within FLOOD_WINDOW seconds pauses that
+    # alert for FLOOD_PAUSE seconds (a flickering USB cable once sent dozens of
+    # "Job finished" messages in a few minutes).
     FLOOD_COUNT, FLOOD_WINDOW, FLOOD_PAUSE = 3, 60.0, 600.0
 
     def flood_check(self, event):
@@ -3245,17 +3822,23 @@ class App:
 
     # ----------------------------------------------------- delivery & mute
     def muted(self):
+        """True while "Mute for 1 hour" is in effect."""
         return time.time() < float(self.s.get("mute_until") or 0)
 
     def mute(self, seconds):
+        """Hold back non-critical alerts for `seconds` (saved, so it survives a
+        restart)."""
         self.s["mute_until"] = time.time() + seconds
         save_settings(self.s)
 
     def unmute(self):
+        """End a mute now."""
         self.s["mute_until"] = 0
         save_settings(self.s)
 
     def in_quiet_hours(self, now=None):
+        """True during the quiet hours set in Notifications. Handles ranges that
+        cross midnight (22:00 to 07:00)."""
         if not self.s["quiet_on"]:
             return False
         h = (now or datetime.now()).hour
@@ -3271,6 +3854,10 @@ class App:
         if (s["report_pc"] if report else s["notify_pc"]):
             self.tray.show(title, body)
             where.append("Windows")
+        # Each channel that's set up becomes a (name, send function) job. The
+        # sends happen on one background thread (network calls can take
+        # seconds), one after the other; a failing channel doesn't stop the
+        # others.
         jobs = []
         if (s["report_tg"] if report else True) and s["tg_token"] and s["tg_chat"]:
             where.append("Telegram")
@@ -3325,6 +3912,11 @@ class App:
         return where
 
     # -------------------------------------------------------- usage reports
+    # How reports are timed: every report kind has "slots" (the top of each
+    # hour, each day at the chosen hour, each week on the chosen day and hour).
+    # settings["report_last"] remembers the last slot sent per kind. Every 20 s
+    # check_reports() looks at the latest slot; if it hasn't been sent, the
+    # report for the period ending at that slot is built and sent.
     def report_slots(self, now):
         """{kind: datetime the most recent report of that kind was due} for the
         reports that are switched on."""
@@ -3353,12 +3945,14 @@ class App:
         save_settings(self.s)
 
     def check_reports(self):
+        """Timer: look for reports that are due, then check again in 20 s."""
         try:
             self._check_reports(datetime.now())
         finally:
             self.root.after(20000, self.check_reports)
 
     def _check_reports(self, now):
+        """Send every report whose latest slot hasn't been sent yet."""
         last = dict(self.s.get("report_last") or {})
         changed = False
         for kind, end in self.report_slots(now).items():
@@ -3385,17 +3979,21 @@ class App:
         return self.deliver(title, body, report=True, status=status)
 
     def _report_toggled(self, kind, var):
+        """A report switch was flipped; switching on starts from the next slot."""
         self.s[f"report_{kind}"] = bool(var.get())
         save_settings(self.s)
         if var.get():
             self._mark_reports_sent([kind])
 
     def _set_report_time(self, key, value, kind):
+        """A report's day or hour was changed; start from the next slot."""
         self.s[key] = value
         save_settings(self.s)
         self._mark_reports_sent([kind])
 
     def send_report_now(self):
+        """The "Send a report now" button: a daily report for the last 24 hours,
+        so people can see what reports look like."""
         title, body, _ = build_report("daily", datetime.now(), self.runlog, self.s["costs"])
         where = self.send_report(title, body, status=self.report_status)
         if not where:
@@ -3408,10 +4006,14 @@ class App:
             self.report_status.configure(text="Sending…", text_color=MUTED)
 
     def _job_label(self):
+        """A second line naming the file and customer for job messages, or ""."""
         bits = [b for b in (self.file_name, self.s["client"]) if b]
         return ("\n" + " · ".join(bits)) if bits else ""
 
     def _notify_change(self, old, new):
+        """Turn a status change into the right notification: started, paused,
+        finished (with run time, cost and today's total) or lost
+        (disconnected mid-job). Called by set_state when a change is final."""
         job = ("busy", "paused")
         if new == "busy" and old not in job:
             self.notify("started", "▶ " + "Job started",
@@ -3435,20 +4037,33 @@ class App:
                         "LightBurn lost the laser during a job." + self._job_label())
 
     def set_appearance(self, value):
+        """Switch between System / Light / Dark. CustomTkinter widgets follow by
+        themselves; the orb and pill are hand-drawn, so they're told to
+        redraw."""
         self.s["appearance"] = value
         save_settings(self.s)
         ctk.set_appearance_mode(value.lower())
         self._orb_key = self._pill_key = None
 
     def set_interval(self, value):
+        """The "Check every" buttons ("0.5 s" etc.). The running detector picks
+        up the new interval on its next loop."""
         self.s["interval"] = float(value.replace(" s", ""))
         self.detector.interval = self.s["interval"]
         save_settings(self.s)
 
     # ------------------------------------------------- how LightBurn is read
+    # How LightBurn is read: saved key -> button label in Settings › Detection.
+    # - ocr: screen reading (Detector), any LightBurn version
+    # - api: LightBurn's REST API (ApiDetector), 2.2+, works when minimised
+    # - both: HybridDetector, the screen when visible plus the API
     DETECT_MODES = {"ocr": "Screen", "api": "API (2.2+)", "both": "Both"}
 
     def make_detector(self):
+        """A new (not yet started) detector for the chosen mode. Without OCR,
+        Both falls back to API. on_trust saves settings when the API reader
+        learns a trustworthy device; it's posted to the UI thread, since the
+        detector thread mustn't write settings while the UI might be."""
         mode = self.s["detect_mode"]
         if mode == "both" and self.ocr is None:
             mode = "api"
@@ -3470,6 +4085,8 @@ class App:
         self.sub_lbl.configure(text="Looking for LightBurn…")
 
     def set_detect_mode(self, label):
+        """A Detection mode button was pressed: save it and switch readers at
+        once. Choosing API or Both for the first time starts pairing."""
         mode = next(k for k, v in self.DETECT_MODES.items() if v == label)
         if mode in ("ocr", "both") and self.ocr is None:
             self.detect_seg.set(self.DETECT_MODES["api"])
@@ -3487,6 +4104,13 @@ class App:
             self.connect_api()              # first time: pair straight away
 
     def connect_api(self):
+        """Pair with LightBurn's API (the Connect button).
+
+        LightBurn shows its own "Allow Beacon?" pop-up; when the user clicks
+        Allow, LightBurn returns a secret that Beacon keeps in settings and
+        uses to sign every request (see beacon/lbapi.py). Pairing waits up to
+        about 30 seconds for that click, so it runs on a thread and reports
+        back through _on_ui."""
         if getattr(self, "_pairing", False):
             return
         self._pairing = True
@@ -3507,6 +4131,8 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def _paired(self, secret, error):
+        """Pairing finished (on the UI thread): save the secret and restart the
+        reader so it uses it, or show why it failed."""
         self._pairing = False
         self.api_btn.configure(state="normal")
         if not secret:
@@ -3520,6 +4146,7 @@ class App:
         self.root.after(1500, self.show_api_status)
 
     def forget_api(self):
+        """The Forget button: drop the pairing secret."""
         self.s["lb_api_secret"] = ""
         save_settings(self.s)
         if self.s["detect_mode"] in ("api", "both"):
@@ -3567,6 +4194,8 @@ class App:
             self.api_status.configure(text=text, text_color=color)
 
     def refresh_ports(self):
+        """Fill the Port dropdown with the serial ports there are now (the ↻
+        button). The saved port stays listed even if it's unplugged."""
         ports = list_ports()
         values = ["Auto-detect"] + [dev for dev, _ in ports]
         if self.s["port"] not in values:
@@ -3575,12 +4204,17 @@ class App:
         self.port_box.set(self.s["port"])
 
     def set_port(self, value):
+        """A port was picked; the Arduino thread switches to it on its next
+        loop."""
         self.s["port"] = value
         self.arduino.port = value
         save_settings(self.s)
 
     # ---------------------------------------------------------- test mode
     def set_test(self, on):
+        """Switch test mode on or off. On: the detector's messages are ignored
+        and statuses come from the test buttons. Off: go straight back to
+        what the detector last reported."""
         self._cancel_demo()
         self.test_mode = bool(on)
         self.test_var.set(self.test_mode)
@@ -3590,6 +4224,7 @@ class App:
         self.update_test_ui()
 
     def simulate(self, status):
+        """A test button: show this status as if LightBurn reported it."""
         self._cancel_demo()
         self.test_mode = True
         self.test_var.set(True)
@@ -3597,6 +4232,9 @@ class App:
         self.update_test_ui()
 
     def toggle_demo_job(self):
+        """Start a 10-second test job (Running, then Ready by itself), or end it
+        early if one is running. Exercises the light, chime and
+        notifications."""
         if self.demo_after:             # stop early = job finished
             self._cancel_demo()
             self.set_state("ready")
@@ -3608,11 +4246,14 @@ class App:
         self.demo_after = self.root.after(10000, self.toggle_demo_job)
 
     def _cancel_demo(self):
+        """Stop a running test job's timer."""
         if self.demo_after:
             self.root.after_cancel(self.demo_after)
         self.demo_after = self.demo_end = None
 
     def update_test_ui(self):
+        """Highlight the test button of the current status and show or hide the
+        TEST MODE banner."""
         for st, b in self.test_buttons.items():
             if self.test_mode and st == self.state:
                 b.configure(fg_color=look(st)[0], hover_color=look(st)[0], text_color="#FFFFFF")
@@ -3627,6 +4268,9 @@ class App:
 
     # ------------------------------------------------------------- relays
     def rebuild_relay_panel(self):
+        """Rebuild the relay buttons on the Home page (two per row), or an "Add
+        relay buttons" link when there are none, and make the window tall
+        enough for them."""
         for w in self.relay_panel.winfo_children():
             w.destroy()
         self.relay_buttons, self._relay_keys = {}, {}
@@ -3661,6 +4305,9 @@ class App:
             self.root.geometry(f"{max(w, 380)}x{560 + extra}")
 
     def set_relay(self, i, key, value):
+        """Change one setting of relay i and save. Adding or removing a relay
+        rebuilds both relay screens; anything else just re-evaluates the
+        relays."""
         self.s["relays"][i][key] = value
         save_settings(self.s)
         if key == "use":
@@ -3670,10 +4317,15 @@ class App:
             self.update_relays()
 
     def toggle_relay(self, i):
+        """A relay button on the Home page was pressed: flip it by hand. The
+        override lasts until the laser's status or the automatic rule changes
+        (see update_relays)."""
         self.relay_override[i] = not self.relay_on[i]
         self.update_relays()
 
     def rename_relay(self, i):
+        """Right-click a relay button: ask for a new name. Setting the name
+        variable saves it through its trace (see rebuild_relays_page)."""
         d = ctk.CTkInputDialog(text=f"New name for the pin {RELAY_PINS[i]} button:",
                                title="Rename button")
         d.attributes("-topmost", True)
@@ -3683,6 +4335,8 @@ class App:
 
     @staticmethod
     def schedule_active(r, now_dt):
+        """True if relay settings r have their schedule covering this moment
+        (day type and hour range, which may cross midnight)."""
         days = r.get("sched_days", "every")
         wd = now_dt.weekday()
         if (days == "weekdays" and wd >= 5) or (days == "weekends" and wd < 5):
@@ -3691,6 +4345,19 @@ class App:
         return (a <= now_dt.hour < b) if a <= b else (now_dt.hour >= a or now_dt.hour < b)
 
     def update_relays(self):
+        """Work out whether every relay should be on right now, and send that
+        out. Runs on every status change and every UI tick (so delays and
+        keep-on times expire on time).
+
+        For each relay, in order:
+        1. wanted: the current status is one its AUTO_MODES rule lists
+        2. on_delay: wanted must have lasted this long before it counts
+        3. keep: it stays on this long after the rule last wanted it
+        4. schedule: forces it on during its hours
+        5. a manual press overrides all that, until something above changes
+        6. safety: the relay chosen to cut during a fire alarm is forced off
+        Arduino relays become bits of one mask sent to both light links;
+        smart plugs / Home Assistant switches go to the PlugWorker thread."""
         now = time.time()
         now_dt = datetime.now()
         mask = 0
@@ -3736,6 +4403,8 @@ class App:
         self.refresh_relay_buttons()
 
     def refresh_relay_buttons(self):
+        """Update each Home page relay button's text and colour (green = on).
+        Only buttons that actually changed are reconfigured."""
         for i, b in self.relay_buttons.items():
             r = self.s["relays"][i]
             on = self.relay_on[i]
@@ -3754,6 +4423,8 @@ class App:
                             hover_color=CARD_BORDER)
 
     def build_stats_page(self):
+        """Build the Statistics page: a header, then everything else is the
+        StatsView class (further down in this file)."""
         p = self.stats_page = ctk.CTkFrame(self.root, fg_color="transparent")
         head = ctk.CTkFrame(p, fg_color="transparent")
         head.pack(fill="x", padx=18, pady=(16, 0))
@@ -3786,6 +4457,8 @@ class App:
             self.root.geometry(self._small_size or "380x560")
 
     def enter_compact(self):
+        """Switch to the compact pill: hide the main window and show the pill
+        where it was last left (or over the window the first time)."""
         self.s["compact"] = True
         save_settings(self.s)
         pos = self.s.get("compact_pos")
@@ -3800,6 +4473,8 @@ class App:
         self._pill_key = None
 
     def leave_compact(self):
+        """Back from the pill to the full window (double-click or Expand),
+        remembering where the pill was."""
         self.s["compact"] = False
         self.s["compact_pos"] = [self.pill.winfo_x(), self.pill.winfo_y()]
         save_settings(self.s)
@@ -3817,20 +4492,27 @@ class App:
         self.root.after(40, self._finish_reveal)
 
     def _finish_reveal(self):
+        """Second half of reveal_window: make the window visible, hide the pill."""
         self.root.update_idletasks()
         self.root.attributes("-alpha", 1.0)
         self.pill.withdraw()
         self.root.lift()
 
     def _pill_press(self, e):
+        """Mouse down on the pill: remember where on the pill it was grabbed."""
         self.hide_pill_menu()
         self._drag = (e.x_root - self.pill.winfo_x(), e.y_root - self.pill.winfo_y())
 
     def _pill_drag(self, e):
+        """Mouse moved with the button down: move the pill along."""
         dx, dy = getattr(self, "_drag", (0, 0))
         self.pill.geometry(f"+{e.x_root - dx}+{e.y_root - dy}")
 
     def quit(self):
+        """Close the app cleanly: hide every window at once, then save settings,
+        finish the running job up to now, remove the tray icon, stop the
+        dashboard and plug workers, switch the light off (the links send
+        "off" when they stop) and give the Arduino thread a moment to do so."""
         if getattr(self, "_quitting", False):     # several windows asked at once
             return
         self._quitting = True
@@ -3863,6 +4545,14 @@ class App:
 
     # ------------------------------------------------------------ updates
     def poll(self):
+        """The UI thread's fast loop (every 50 ms): handle every queued message,
+        then settle a pending job end and collect garbage.
+
+        Message kinds on self.q:
+        - {"cmd": "show"}: another copy of Beacon was started; show this one
+        - {"cmd": "call", "fn": f}: run f here (from a background thread)
+        - anything else: a detector reading (see Detector.run)
+        In test mode readings are ignored so the test buttons stay in charge."""
         try:
             while True:
                 msg = self.q.get_nowait()
@@ -3897,6 +4587,16 @@ class App:
                 self._gc_full_at = now
         self.root.after(50, self.poll)
 
+    # ---- The status state machine ------------------------------------------
+    # set_state() decides what's shown; _apply_state() does the bookkeeping;
+    # settle_job_end() completes changes that were held back. Two hold-backs:
+    # - _end_pending: a job stopped (Running/Paused -> something else). The
+    #   light and pill change at once, but the job only ends after JOB_END_GRACE
+    #   without running again. If it runs again within that time it's the same
+    #   job (multi-pass jobs, flickering connections).
+    # - _resume_pending: Paused -> Running. LightBurn briefly shows Busy when a
+    #   paused job is stopped, so Running is only shown after RESUME_HOLD; if
+    #   something else comes first, it was a stop, and Paused never turned red.
     JOB_END_GRACE = 2.0     # a job is only finished after this long without running
 
     def set_state(self, new, at=None):
@@ -3958,6 +4658,9 @@ class App:
 
     RESUME_HOLD = 0.8       # Paused -> Running must last this long to count as a resume
 
+    # Both hold-backs are timed from "seen" (when this app received the change),
+    # not "at" (when the reader says it began): a reader can backdate a change,
+    # and timing from that could end the wait before it started.
     def settle_job_end(self):
         """Called every tick: confirm a resume, and finish a job once it has
         really stopped."""
@@ -4006,6 +4709,8 @@ class App:
         self.update_relays()
 
     def push_arduino(self):
+        """Send the current status letter (and app alarm) to the USB and Wi-Fi
+        lights, waking their threads only when something changed."""
         code = self.arduino_code()
         if DEV and code != self.arduino.code:      # dev only: what the light is told, and why
             logging.info("light %s <- %s (resume pending %s, end pending %s)",
@@ -4017,6 +4722,8 @@ class App:
                 link.wake.set()
 
     def arduino_code(self):
+        """The one-letter status code for the light (see the protocol above
+        LinkBase). Framing/Disconnected use capitals when blinking is on."""
         blink = self.s["blink"]
         return {
             "busy": b"B", "paused": b"P", "ready": b"R",
@@ -4046,6 +4753,9 @@ class App:
         return self.last_job
 
     def subtitle(self):
+        """The line under the big status word on the Home page: job timer, % and
+        time left while running; the last job's time when ready or framing;
+        and otherwise a hint about why the status can't be seen."""
         st = self.state
         if st == "busy":
             text = "Job running"
@@ -4072,6 +4782,7 @@ class App:
         return (self.last_msg.get("note") or "Can't see LightBurn's status")
 
     def tick(self):
+        """Redraw five times a second (blinking, timers), forever."""
         self.render()
         self.root.after(200, self.tick)
 
@@ -4087,6 +4798,12 @@ class App:
         return (CARD_BORDER, 1, None)       # disconnected / can't see LightBurn
 
     def render(self):
+        """Bring everything on screen up to date. Called by tick() and when the
+        window is revealed. Work is skipped where possible: the orb and pill
+        dot are only redrawn when their look changed, hidden windows aren't
+        touched, and page-specific updates only run while that page is open.
+        Also runs the monitor (alerts) and keeps the light, relays and job
+        checkpoint current."""
         now = time.time()
         try:
             self.monitor(now)               # alerts, sensors, maintenance, dashboard
@@ -4166,6 +4883,8 @@ class App:
         self.runlog.checkpoint()
 
     def update_diag(self):
+        """Fill the Diagnostics box with the last reading: how it was read, the
+        raw and shown status, the note, and the text that was read."""
         m = self.last_msg
         text = (f"read: {m.get('mode', '')}   raw: {m.get('raw')}   shown: {m.get('shown')}\n"
                 + ("note: " + m["note"] + "\n" if m.get("note") else "")
@@ -4179,6 +4898,9 @@ class App:
         self.diag.configure(state="disabled")
 
     def draw_orb(self, color, on):
+        """Draw the big status orb: a glow of 12 rings fading out from the core,
+        the solid core, and a slightly lighter centre for depth. on=False
+        draws it dimmed (the "off" phase of blinking)."""
         c = self.orb
         card = pick(CARD)
         c.configure(bg=card)
@@ -4199,6 +4921,7 @@ class App:
                       fill=blend(core, "#FFFFFF", 0.10 if on else 0.03), outline="")
 
     def draw_pill(self, color, on):
+        """Draw the pill's dot: a faint halo and a solid centre."""
         c = self.pill_dot
         card = pick(CARD)
         c.configure(bg=card)
@@ -4212,11 +4935,15 @@ class App:
 
     # ============================================================ monitoring
     def _job_run(self, now):
+        """Running seconds of the current job so far (pauses not counted)."""
         cur = self.runlog.current(now)
         return cur["run"] if cur else ((now - self.job_start) if self.job_start else 0.0)
 
     def monitor(self, now):
         """Runs every tick: alerts, sensors, maintenance, dashboard snapshot."""
+        # Each check below fires its notification once and remembers that it did
+        # (job_alerts for things that reset with every new job, or its own
+        # flag).
         s, st = self.s, self.state
         if s.get("mute_until") and now > float(s["mute_until"]):
             self.unmute()
@@ -4299,17 +5026,29 @@ class App:
             "relays": [{"index": i, "name": r["name"], "on": self.relay_on[i],
                         "auto": r["auto"] != "manual" and self.relay_override[i] is None}
                        for i, r in enumerate(s["relays"]) if r["use"]]}
+        # Hovering the tray icon shows the current status.
         tip = f"{WINDOW_TITLE} — {title}"
         if tip != getattr(self, "_tray_tip", None):
             self._tray_tip = tip
             self.tray.set_tip(tip)
 
     def temperature(self, raw):
+        """Degrees C from the board's analog reading (0-1023 for 0-5 V). LM35:
+        10 mV per degree from 0 V. TMP36: 10 mV per degree with a 500 mV
+        offset (so it can read below zero)."""
         if self.s["temp_type"] == "TMP36":
             return (raw * 5000 / 1023 - 500) / 10
         return raw * 500 / 1023                     # LM35: 10 mV per °C
 
     def process_inputs(self, now):
+        """React to the safety inputs from whichever light link is enabled and
+        has reported in the last 5 seconds: fire/smoke, temperature, lid
+        opened during a job, no exhaust/coolant flow (for 10 s while
+        running), and presses of the board's button.
+
+        Builds alarm_text for the red banner and app_alarm for the buzzer. An
+        alarm the user acknowledged stays silent until every alarm has
+        cleared; a new problem after that sounds again."""
         link = next((l for l in (self.arduino, self.netlight)
                      if l.enabled and l.inputs and now - l.inputs["time"] < 5), None)
         self.live_inputs = link.inputs if link else None
@@ -4365,6 +5104,9 @@ class App:
         if self.flow_alerted:
             alarms.append("No exhaust / cooling flow")
         # the button on A1
+        # The board counts presses; a different count than last time means it
+        # was pressed. First silence an alarm, otherwise do the chosen button
+        # action.
         if self.last_presses is not None and inp["presses"] != self.last_presses:
             if alarms and not getattr(self, "alarm_acked", False):
                 self.acknowledge_alarm()
@@ -4389,6 +5131,8 @@ class App:
         self.push_arduino()
 
     def update_banners(self):
+        """Show or hide the Home page's banners above the status card: the red
+        alarm banner, and "Can't read LightBurn" after 20 s without a status."""
         now = time.time()
         alarm = getattr(self, "alarm_text", "")
         want = {
@@ -4408,26 +5152,37 @@ class App:
                 banner.pack_forget()
 
     def find_lightburn_again(self):
+        """The "click to look again" banner: forget where the status was and
+        scan every window afresh."""
         self.detector.reset()
         self.unreadable_since = None
         self.sub_lbl.configure(text="Looking for LightBurn…")
 
     # ======================================================= phone dashboard
     def dash_state(self):
+        """What the phone dashboard shows, called from the dashboard's server
+        thread. It returns a copy of a snapshot that monitor() builds on the
+        UI thread, so the server never reads live UI state."""
         return dict(self._dash_snapshot)
 
     def dash_command(self, name, data):
+        """A button pressed on the phone (server thread): hand it to the UI
+        thread. Only relay toggling is offered."""
         if name == "relay":
             self._on_ui(lambda: self._dash_toggle(int(data.get("index", -1))))
 
     def _dash_toggle(self, i):
+        """Toggle relay i from the phone, if it's a relay in use."""
         if 0 <= i < len(RELAY_PINS) and self.s["relays"][i]["use"]:
             self.toggle_relay(i)
 
     def start_dashboard(self):
+        """Start the phone dashboard web server on the chosen port and PIN."""
         return self.dash.start(self.s["dash_port"], self.s["dash_pin"])
 
     def _dash_changed(self):
+        """The dashboard switch or its port changed: start or stop the server
+        and check the firewall."""
         if self.s["dash_on"]:
             self.start_dashboard()
         else:
@@ -4444,6 +5199,7 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def _show_firewall(self, ok):
+        """Show the firewall result on the Phone & Wi-Fi page (None = unknown)."""
         self._fw_ok = ok
         if ok:
             self.fw_status.configure(text="✓ Allowed through Windows Firewall", text_color=MUTED)
@@ -4455,6 +5211,9 @@ class App:
                 self.fw_btn.pack(side="left", padx=6)
 
     def allow_firewall(self):
+        """The "Allow on Wi-Fi" button: add a Windows Firewall rule for the
+        dashboard port. Windows asks for administrator permission; the result
+        is checked again 3 seconds later."""
         if not winsys.firewall_allow(self.s["dash_port"], f"{APP_NAME} phone dashboard"):
             self.fw_status.configure(text="Not allowed: Windows asked for permission and it "
                                           "was declined.", text_color=RED)
@@ -4467,6 +5226,11 @@ class App:
         """Background: reads messages sent to the bot (long polling) and passes
         commands from your chat to the UI thread. Also remembers the last chat
         that wrote, for the Find button."""
+        # Long polling: getUpdates waits up to 25 s for a new message, so
+        # replies are instant without asking Telegram every second. offset =
+        # last update id + 1 tells Telegram which messages have been handled.
+        # Only messages from the configured chat are obeyed; anyone else who
+        # finds the bot is ignored.
         offset = None
         self._tg_seen = None
         while True:
@@ -4495,6 +5259,7 @@ class App:
                     self._on_ui(lambda t=text: self.tg_command(t))
 
     def tg_reply(self, text):
+        """Send a reply to the configured chat in the background."""
         token, chat = self.s["tg_token"], self.s["tg_chat"]
 
         def work():
@@ -4505,6 +5270,9 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def tg_command(self, text):
+        """Answer one Telegram command (UI thread). "/on fan" turns on the first
+        relay whose name starts with "fan"; "/mute 2" mutes for two hours.
+        "/status@MyBot" (the form used in groups) works too."""
         cmd, _, arg = text[1:].partition(" ")
         cmd, arg = cmd.split("@")[0].lower(), arg.strip()
         now = time.time()
@@ -4571,6 +5339,10 @@ class App:
 
     # ================================================ Windows: tray, hotkey
     def apply_windows_settings(self):
+        """Apply the Windows settings: the "Start with Windows" registry entry
+        (started with --startup, which opens straight into the pill), the
+        tray icon, and the global hotkey Ctrl+Alt+<key>. The hotkey can fail
+        if another app already owns it, which is shown under the setting."""
         s = self.s
         try:
             winsys.autostart_set(APP_NAME, bool(s["autostart"]),
@@ -4589,6 +5361,8 @@ class App:
                 text_color=RED)
 
     def hotkey_pressed(self):
+        """Ctrl+Alt+<key>: toggle between the full window and the pill, or show
+        the window if it's minimised or hidden."""
         if self.s["compact"]:
             self.leave_compact()
         elif self.root.state() == "normal":
@@ -4597,17 +5371,22 @@ class App:
             self.bring_to_front_full()
 
     def bring_to_front_full(self):
+        """Show the full window (from the pill, tray or another launch)."""
         if self.s["compact"]:
             self.leave_compact()
         else:
             self.bring_to_front()
 
     def _set_value(self, key, value):
+        """Save one setting (used by dropdowns that convert their text first)."""
         self.s[key] = value
         save_settings(self.s)
 
     # ================================================================ updates
     def check_updates(self, auto=False):
+        """Look for a newer version at UPDATE_URL (empty in this build, so off).
+        auto=True is the hourly timer: it only checks once a day and only if
+        "Check for updates" is on. The network request runs on a thread."""
         if auto:
             self.root.after(3600 * 1000, lambda: self.check_updates(auto=True))
             if (not self.s["auto_update"] or not UPDATE_URL
@@ -4633,6 +5412,9 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def _update_found(self, info, auto):
+        """Show the result of an update check. A new version turns the button
+        into "Install <version>"; the automatic check also shows one Windows
+        notification per version."""
         self.ensure_page("settings")            # its Help & updates section shows this
         if not info:
             if not auto:
@@ -4651,6 +5433,8 @@ class App:
                            "Open Settings › Help & updates to install it.")
 
     def install_update(self):
+        """Download the new installer (showing progress), start it, and quit so
+        it can replace the files."""
         info = getattr(self, "pending_update", None)
         if not info:
             return
@@ -4671,10 +5455,16 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     # ============================================================ diagnostics
+    # Secret settings. They're replaced with *** in the settings.json copy put
+    # in a diagnostics zip, so sending one to support never shares passwords,
+    # tokens or the LightBurn pairing secret.
     REDACT = ("tg_token", "pushover_token", "pushover_user", "email_pass", "twilio_token",
               "twilio_sid", "discord_url", "ha_token", "dash_pin", "lb_api_secret")
 
     def debug_info(self):
+        """A plain-text summary for support: versions, reading mode, the current
+        status and reading, link states, which features are on (names only,
+        never their values) and the last text read."""
         s = self.s
         on = [k for k in ("arduino", "wifi_on", "dash_on", "notify_pc", "tg_commands", "discord_on",
                           "pushover_on", "email_on", "sms_on", "snapshot_on", "sensor_fire",
@@ -4698,11 +5488,15 @@ class App:
         return "\n".join(lines)
 
     def copy_debug_info(self):
+        """Help page: copy debug_info() to the clipboard."""
         self.root.clipboard_clear()
         self.root.clipboard_append(self.debug_info())
         self.help_status.configure(text="Copied. Paste it into your email to support.")
 
     def save_diagnostics(self):
+        """Help page: save a zip with debug info, the settings (secrets
+        redacted), the log files, the last 200 jobs and the detection check
+        summary."""
         path = filedialog.asksaveasfilename(parent=self.root, defaultextension=".zip",
                                             initialfile=f"{APP_NAME}-diagnostics.zip",
                                             filetypes=[("Zip file", "*.zip")])
@@ -4724,6 +5518,7 @@ class App:
             self.help_status.configure(text=str(e))
 
     def open_settings_folder(self):
+        """Open the settings folder in Explorer."""
         os.makedirs(CONFIG_DIR, exist_ok=True)
         os.startfile(CONFIG_DIR)
 
@@ -4744,10 +5539,12 @@ class App:
         return total
 
     def week_start(self):
+        """Monday 00:00 of this week."""
         today = date.today()
         return datetime.combine(today - timedelta(days=today.weekday()), datetime.min.time())
 
     def goal_line(self):
+        """"Weekly goal: 12.5 / 20 h (62%)", or "" when no goal is set."""
         now = time.time()
         run = self.runlog.run_between(self.week_start().timestamp(), now, now) / 3600
         goal = float(self.s["goal_hours"] or 0)
@@ -4755,12 +5552,16 @@ class App:
 
     # ===================================================== settings subpages
     def build_subpages(self):
+        """Build the three pages opened from Settings › Notifications: More
+        channels, Alerts & safety, Phone & Wi-Fi (built together on first
+        use)."""
         self.subpages = {}
         self._build_channels_page()
         self._build_safety_page()
         self._build_remote_page()
 
     def channel_test(self, box, name):
+        """A "Send test" button with a result line under it, for one channel."""
         row = ctk.CTkFrame(box, fg_color="transparent")
         row.pack(fill="x", padx=14, pady=(8, 0))
         status = ctk.CTkLabel(box, text="", font=self.font(11), text_color=MUTED, anchor="w",
@@ -4770,6 +5571,8 @@ class App:
         status.pack(fill="x", padx=14, pady=(4, 10))
 
     def test_channel(self, name, status):
+        """Send a test through one channel (Discord, Pushover, Email, SMS or a
+        camera photo) on a background thread and show the result in `status`."""
         s = self.s
         title, body = f"\U0001F514 {APP_NAME} test", "This channel is working."
         status.configure(text="Sending…", text_color=MUTED)
@@ -4802,6 +5605,9 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def _build_channels_page(self):
+        """More channels page: Discord, Pushover, email, SMS (Twilio) and the
+        camera snapshot, each with its own on switch, fields and test button.
+        Secret fields (tokens, passwords) are typed into masked boxes."""
         p, body = self.page_frame("More channels")
         self.subpages["channels"] = p
         box = self.section(body, "Discord")
@@ -4851,6 +5657,9 @@ class App:
         self.channel_test(box, "Camera")
 
     def _build_safety_page(self):
+        """Alerts & safety page: long or unusual jobs, long pauses, "laser
+        free", unattended runs, and the safety sensors with what the board's
+        button does. The pin names (A1-A5) match laser_stack_light.ino."""
         p, body = self.page_frame("Alerts & safety")
         self.subpages["safety"] = p
         mins = lambda vals: {v: (f"{v} min" if v else "Off") for v in vals}
@@ -4898,6 +5707,8 @@ class App:
                        "leave a running laser unattended.", pady=(0, 10))
 
     def _build_remote_page(self):
+        """Phone & Wi-Fi page: the phone dashboard (port, PIN, firewall) and the
+        ESP32 Wi-Fi light's address."""
         p, body = self.page_frame("Phone & Wi-Fi")
         self.subpages["remote"] = p
         box = self.section(body, "Phone dashboard")
@@ -4927,6 +5738,9 @@ class App:
         self.wifi_status = self.note(box, "", pady=(4, 10))
 
     def refresh_subpage_status(self):
+        """Live lines on the open subpage (called from render): dashboard
+        addresses and Wi-Fi light status, live sensor readings, or the smart
+        plugs' status on the Relay buttons page."""
         if self.page == "remote":
             self.wifi_status.configure(text=self.netlight.status if self.s["wifi_on"] else "")
             if self.dash.running():
@@ -4951,6 +5765,12 @@ class App:
                 lbl.configure(text=self.plugs.status.get(i, "Waiting…"))
 
     # ================================================================ wizard
+    # The setup assistant. Each step is a method (_wiz_welcome, _wiz_lightburn,
+    # ...) that fills wiz_body with text and real controls (the same helpers and
+    # settings as the Settings page, so a choice made here is the same setting).
+    # wiz_show() clears the body and calls the current step. To add a step,
+    # write a method and add it to wiz_steps. A step can create a live status
+    # line with _wiz_live_label(); update_wizard_live() keeps it current.
     def build_wizard_page(self):
         """The setup assistant: a short page per feature, most important first,
         with the real controls on each page. Shown on first run and from
@@ -4978,6 +5798,8 @@ class App:
         self.wiz_show()
 
     def wiz_go(self, delta):
+        """Next (+1) / Back (-1). Past the last step = Finish: leave test mode,
+        mark setup as done (so it isn't shown at the next start) and go Home."""
         if self.wiz_step + delta >= len(self.wiz_steps):
             if self.test_mode:
                 self.set_test(False)            # leave test mode on Finish
@@ -4989,6 +5811,7 @@ class App:
         self.wiz_show()
 
     def wiz_show(self):
+        """Draw the current step and update the buttons and "3 of 9" counter."""
         for w in self.wiz_body.winfo_children():
             w.destroy()
         self.wiz_live = None
@@ -5001,17 +5824,20 @@ class App:
 
     # -- building blocks
     def _wiz_text(self, text, color=MUTED, size=12, bold=False, pady=(2, 6)):
+        """A wrapped paragraph in the setup assistant."""
         ctk.CTkLabel(self.wiz_body, text=text, font=self.font(size, "bold" if bold else "normal"),
                      text_color=color, anchor="w", justify="left",
                      wraplength=310).pack(fill="x", padx=8, pady=pady)
 
     def _wiz_card(self):
+        """A card to hold controls in the setup assistant."""
         box = ctk.CTkFrame(self.wiz_body, fg_color=CARD, corner_radius=14, border_width=1,
                            border_color=CARD_BORDER)
         box.pack(fill="x", padx=4, pady=(4, 6))
         return box
 
     def _wiz_live_label(self):
+        """A bold live status line (e.g. "Beacon can see LightBurn: Ready")."""
         self.wiz_live = ctk.CTkLabel(self.wiz_body, text="", font=self.font(12, "bold"),
                                      text_color=TEXT, anchor="w", justify="left", wraplength=310)
         self.wiz_live.pack(fill="x", padx=8, pady=(4, 6))
@@ -5019,6 +5845,7 @@ class App:
 
     # -- the steps
     def _wiz_welcome(self):
+        """Step: welcome and the feature list."""
         self.wiz_title.configure(text=f"Welcome to {APP_NAME}")
         self._wiz_text(f"{APP_NAME} shows what your laser is doing (Running, Paused, Framing, "
                        "Ready) on your screen, on a stack light and on your phone.",
@@ -5034,6 +5861,8 @@ class App:
                        "in Settings.", pady=(10, 4))
 
     def _wiz_lightburn(self):
+        """Step 1: how LightBurn is read, with the mode switch and a live check
+        that Beacon can see it."""
         self.wiz_title.configure(text="1  ·  Reading LightBurn")
         self._wiz_text("Screen (OCR)", color=TEXT, bold=True, pady=(4, 0))
         self._wiz_text("Beacon looks at LightBurn's Laser panel and reads the status text, the "
@@ -5057,11 +5886,13 @@ class App:
             anchor="w", padx=8, pady=(0, 6))
 
     def _wiz_set_mode(self, label):
+        """The mode switch in the assistant: same as Settings › Detection."""
         self.set_detect_mode(label)
         if hasattr(self, "detect_seg"):         # keep Settings' switch in step
             self.detect_seg.set(self.DETECT_MODES[self.s["detect_mode"]])
 
     def _wiz_stacklight(self):
+        """Step 2: Arduino stack light wiring, upload and COM port."""
         self.wiz_title.configure(text="2  ·  Stack light")
         self._wiz_text("Optional. An Arduino Uno switches a red / green stack light (red = "
                        "running, green = ready) and beeps when a job ends. No light? Press Next.")
@@ -5084,6 +5915,7 @@ class App:
         combo.pack(side="right")
 
         def refresh():
+            """Re-list the COM ports in the assistant's dropdown."""
             values = ["Auto-detect"] + [dev for dev, _ in list_ports()]
             combo.configure(values=values)
         ctk.CTkButton(r, text="↻", width=30, height=28, corner_radius=8,
@@ -5092,6 +5924,7 @@ class App:
         self._wiz_live_label()
 
     def _wiz_relays(self):
+        """Step 3: what relay buttons are, with a link to set them up."""
         self.wiz_title.configure(text="3  ·  Relay buttons")
         self._wiz_text("Relay buttons switch extra things from Beacon: a fan, air assist, "
                        "exhaust or lights. They use relays on the Arduino, or smart plugs "
@@ -5105,6 +5938,7 @@ class App:
                        "buttons.", size=11)
 
     def _wiz_open_relays(self):
+        """Open Relay buttons from the assistant; Back returns to it."""
         self.open_relays("wizard")
 
     def open_relays(self, back_to):
@@ -5113,6 +5947,8 @@ class App:
         self.show_page("relays")
 
     def _wiz_telegram(self):
+        """Step 4: Telegram bot token, Chat ID (Find), test and commands. Uses
+        the same text variables as Settings, so both show the same values."""
         self.wiz_title.configure(text="4  ·  Telegram bot")
         self._wiz_text("Get a message on your phone when a job finishes, pauses or the laser "
                        "disconnects, and ask Beacon for /status from anywhere. Optional.")
@@ -5140,6 +5976,8 @@ class App:
         self._wiz_live_label()
 
     def _wiz_notifications(self):
+        """Step 5: Windows pop-ups, the main events, quiet hours, and how Beacon
+        avoids nagging."""
         self.wiz_title.configure(text="5  ·  Notifications")
         self._wiz_text("Pick what you want to hear about. Windows pop-ups and Telegram both "
                        "follow these.")
@@ -5159,6 +5997,7 @@ class App:
                        "tray icon.", size=11, pady=(2, 6))
 
     def _wiz_reports(self):
+        """Step 6: daily / weekly reports and what Statistics offers."""
         self.wiz_title.configure(text="6  ·  Reports & quotes")
         self._wiz_text("Beacon counts only real running time (pauses left out) and can send "
                        "you a report by Telegram or Windows pop-up:")
@@ -5176,6 +6015,7 @@ class App:
                        "reports.", pady=(4, 6))
 
     def _wiz_test(self):
+        """Step 7: test mode and a 10 s test job."""
         self.wiz_title.configure(text="7  ·  Test mode")
         self._wiz_text("Try it all without the laser: test mode fakes LightBurn's status, so "
                        "you can watch the light, relays and notifications work. Test jobs "
@@ -5186,6 +6026,7 @@ class App:
                        "Settings › Test mode. Finish turns test mode off.", size=11)
 
     def _wiz_support(self):
+        """Last page: thanks, and a tip button when TIP_URL is set."""
         self.wiz_title.configure(text="Thank you!")
         self._wiz_text(f"{APP_NAME} is free and its source code is public, so anyone can use "
                        "it and help improve it.", color=TEXT, size=13)
@@ -5227,6 +6068,9 @@ class App:
 
     # ============================================================ help page
     def build_help_page(self):
+        """Help page: Arduino wiring diagram, ESP32 pins, the FAQ (HELP_FAQ) and
+        support tools (copy debug info, save diagnostics, open settings
+        folder)."""
         p, body = self.page_frame("Help", back="status")
         self.help_page = p
         box = self.section(body, "Wiring (Arduino Uno)")
@@ -5261,6 +6105,9 @@ class App:
         self.help_status = self.note(box, "", pady=(4, 10))
 
     def _draw_wiring(self, box):
+        """Draw the Arduino Uno wiring as a simple diagram: the board on the
+        left, one coloured line per pin to what connects there. Pin numbers
+        must match laser_stack_light.ino."""
         s = self.scale
         W, H = int(320 * s), int(330 * s)
         c = tk.Canvas(box, width=W, height=H, highlightthickness=0, bd=0, bg=pick(CARD))
@@ -5304,6 +6151,7 @@ class App:
         """Second launches connect here (see claim_single_instance) and ask us
         to come forward instead of opening another copy."""
         def serve():
+            """Accept connections forever; each one means "show yourself"."""
             while True:
                 try:
                     conn, _ = server.accept()
@@ -5322,17 +6170,21 @@ class App:
         self.root.iconify()
 
     def _root_mapped(self, e):
+        """The main window was shown (e.g. its taskbar icon clicked)."""
         # Restored from the taskbar while in pill mode: show the pill again
         if e.widget is self.root and self._pill_minimized and self.s["compact"]:
             self.restore_pill()
 
     def restore_pill(self):
+        """Show the pill again after it was minimised to the taskbar."""
         self._pill_minimized = False
         self.root.withdraw()
         self.pill.deiconify()
         self.pill.lift()
         self._pill_key = None
 
+    # Hand control to Tk: from here on everything happens in callbacks (poll,
+    # tick, button commands) until quit() destroys the window.
     def run(self):
         self.root.mainloop()
 
@@ -5344,6 +6196,8 @@ BLUE = "#3B82F6"
 
 
 def nice_125(target):
+    """The smallest "nice" number (1, 2 or 5 times a power of ten) at least
+    target: 0.7 -> 1, 13 -> 20, 340 -> 500. Used for chart grid steps."""
     e = 10 ** math.floor(math.log10(target))
     for m in (1, 2, 5, 10):
         if m * e >= target:
@@ -5351,6 +6205,10 @@ def nice_125(target):
 
 
 def nice_step(vmax, ticks):
+    """Distance between chart grid lines for values up to vmax, aiming at about
+    4 lines. ticks="dur" (seconds) snaps to clock-friendly steps (1, 5, 10,
+    15, 30 min, 1, 2, 3, 6, 12, 24 h); "count" keeps whole numbers; anything
+    else (money) uses nice_125."""
     target = vmax / 4 if vmax > 0 else 1
     if ticks == "dur":
         for c in (60, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400):
@@ -5362,6 +6220,11 @@ def nice_step(vmax, ticks):
     return nice_125(target)
 
 
+# A chart is described by a plain dict ("spec") built by StatsView.spec() and
+# drawn by the method named after its kind (_bars, _line, ...). Common keys:
+# values, labels (under the x axis), tips (hover text per value), color, fmt
+# (value -> text), axis (grid value -> text), ticks (see nice_step). Every drawn
+# element registers a hover rectangle in self.hits for the tooltip.
 class Chart(tk.Canvas):
     """spec kinds: bars / line (labels, tips, values), heatmap (rows, cols,
     col_tips, matrix), donut (parts, center, center_sub), empty (text)."""
@@ -5377,10 +6240,13 @@ class Chart(tk.Canvas):
         self.bind("<Leave>", lambda e: self.delete("tip"))
 
     def show(self, spec):
+        """Draw a new spec."""
         self.spec = spec
         self.redraw()
 
     def redraw(self):
+        """Draw the current spec at the canvas's current size (also on resize
+        and theme change). Too small to draw: leave it blank."""
         self.delete("all")
         self.hits = []
         card = pick(CARD)
@@ -5390,10 +6256,13 @@ class Chart(tk.Canvas):
             getattr(self, "_" + self.spec["kind"])(self.spec, w, h, card)
 
     def _empty(self, sp, w, h, card):
+        """No data: a centred message instead of a chart."""
         self.create_text(w / 2, h / 2, text=sp["text"], fill=pick(MUTED), font=(FONT, 11),
                          width=w * 0.7, justify="center")
 
     def _axes(self, sp, w, h):
+        """Draw the horizontal grid lines and their labels. Returns the plot
+        area (left, right, top, bottom) and the value at the top line."""
         s = self.s
         L, R, T, B = 66 * s, w - 16 * s, 16 * s, h - 32 * s
         vmax = max(sp["values"]) if sp["values"] else 0
@@ -5409,6 +6278,8 @@ class Chart(tk.Canvas):
         return L, R, T, B, top
 
     def _xlabels(self, labels, L, R, B):
+        """Labels under the x axis; when there are too many to fit (about one
+        per 56 px), only every n-th is drawn."""
         n = len(labels)
         slot = (R - L) / n
         every = max(1, math.ceil(n / max(1.0, (R - L) / (56 * self.s))))
@@ -5418,6 +6289,7 @@ class Chart(tk.Canvas):
                                  fill=pick(MUTED), font=self.f)
 
     def _bars(self, sp, w, h, card):
+        """Bar chart: one bar per value, centred in its slot."""
         L, R, T, B, top = self._axes(sp, w, h)
         vals = sp["values"]
         slot = (R - L) / len(vals)
@@ -5432,6 +6304,8 @@ class Chart(tk.Canvas):
         self._xlabels(sp["labels"], L, R, B)
 
     def _line(self, sp, w, h, card):
+        """Line chart with a lightly filled area under it (cumulative charts).
+        Dots mark the points while there are few enough to tell apart."""
         L, R, T, B, top = self._axes(sp, w, h)
         vals = sp["values"]
         slot = (R - L) / len(vals)
@@ -5450,6 +6324,8 @@ class Chart(tk.Canvas):
         self._xlabels(sp["labels"], L, R, B)
 
     def _heatmap(self, sp, w, h, card):
+        """Day-of-week by hour grid: the stronger the colour, the more running
+        in that hour. Empty cells are a faint grey."""
         s = self.s
         L, R, T, B = 48 * s, w - 16 * s, 16 * s, h - 32 * s
         m = sp["matrix"]
@@ -5472,6 +6348,9 @@ class Chart(tk.Canvas):
                                  font=self.f)
 
     def _donut(self, sp, w, h, card):
+        """Donut chart with a legend on the right (the cost breakdown). Slices
+        start at the top and go clockwise; a single 100% slice is drawn as a
+        full circle because Tk can't draw a 360° arc."""
         s = self.s
         parts = [p for p in sp["parts"] if p[1] > 0]
         total = sum(v for _, v, _ in parts)
@@ -5501,6 +6380,8 @@ class Chart(tk.Canvas):
             y += 30 * s
 
     def _hover(self, e):
+        """Show the tooltip of the element under the mouse, kept inside the
+        canvas (flipped left / below near the edges)."""
         self.delete("tip")
         for x0, y0, x1, y1, text in self.hits:
             if x0 <= e.x < x1 and y0 <= e.y < y1:
@@ -5524,6 +6405,10 @@ class Chart(tk.Canvas):
 # ===========================================================================
 # Statistics window
 # ===========================================================================
+# Statistics choices. Chart menus map a label to (kind, grouping) used by
+# StatsView.spec(): "time" = bars per day/week/month, "cumulative" = running
+# total line, "hours" / "weekdays" = totals by hour of day / day of week,
+# "heatmap", "jobs" (count per day), "breakdown" (cost donut).
 RANGES = {"Last 7 days": 7, "Last 30 days": 30, "Last 90 days": 90,
           "Last 12 months": 365, "All time": None}
 USAGE_CHARTS = {"Run time per day": ("time", "day"), "Run time per week": ("time", "week"),
@@ -5549,11 +6434,16 @@ WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 
 def fmt_axis_dur(v):
+    """Grid label for seconds: "0", "30 m", "1.5 h"."""
     if v == 0:
         return "0"
     return f"{v / 3600:g} h" if v >= 3600 else f"{v / 60:g} m"
 
 
+# Six tabs: Usage, Costs, Jobs, Customers, Quote, Maintenance. Everything is
+# computed from RunLog's jobs. While the page is open, refresh() runs every 3 s
+# so the numbers follow a running job; charts and lists are only redrawn when
+# what they show changed (see the signatures in self._sigs).
 class StatsView:
     """The Statistics page, built inside the main window."""
 
@@ -5574,15 +6464,19 @@ class StatsView:
         self.build_maint(tabs.add("Maintenance"))
 
     def alive(self):
+        """True while the Statistics page is the one shown."""
         return self.app.page == "stats"
 
     def stop(self):
+        """Stop the 3-second refresh (the page was left)."""
         if self._after:
             self.win.after_cancel(self._after)
             self._after = None
 
     # -------------------------------------------------------------- layout
     def card(self, parent, row, col, title):
+        """A number card (title, big value, small line under it) placed in a
+        grid. Returns the (value label, sub label) pair that set() fills in."""
         f = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=14, border_width=1,
                          border_color=CARD_BORDER)
         f.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
@@ -5596,6 +6490,8 @@ class StatsView:
         return value, sub
 
     def card_grid(self, parent, names, cols):
+        """A grid of number cards. names: [(key, title), ...]. Returns {key:
+        (value label, sub label)}."""
         grid = ctk.CTkFrame(parent, fg_color="transparent")
         grid.pack(fill="x")
         for c in range(cols):
@@ -5604,6 +6500,8 @@ class StatsView:
                 for n, (key, title) in enumerate(names)}
 
     def chart_area(self, parent, charts, default):
+        """The chart and range dropdowns above a chart. Returns (chart, chart
+        choice variable, range variable, the controls row for extra buttons)."""
         ctl = ctk.CTkFrame(parent, fg_color="transparent")
         ctl.pack(fill="x", pady=(10, 6), padx=5)
         chart_var = ctk.StringVar(value=default)
@@ -5621,6 +6519,7 @@ class StatsView:
         return chart, chart_var, range_var, ctl
 
     def build_usage(self, tab):
+        """Usage tab: ten number cards and a chart with CSV export."""
         self.ucards = self.card_grid(tab, [
             ("total", "Total run time"), ("session", "This session"), ("today", "Today"),
             ("week", "Last 7 days"), ("month", "Last 30 days"), ("jobs", "Jobs"),
@@ -5637,6 +6536,8 @@ class StatsView:
                      text_color=MUTED).pack(side="right", padx=10)
 
     def build_costs(self, tab):
+        """Costs tab: the cost inputs on the left (saved as you type), cost
+        cards and a cost chart on the right."""
         left = ctk.CTkScrollableFrame(tab, width=250, fg_color=CARD, corner_radius=14,
                                       border_width=1, border_color=CARD_BORDER)
         left.pack(side="left", fill="y", padx=(5, 5), pady=5)
@@ -5675,6 +6576,8 @@ class StatsView:
 
     # ------------------------------------------------------------- costs
     def set_cost(self, key, var, entry):
+        """Validate and save one cost input. Bad numbers turn the box's border
+        red and aren't saved; a comma works as the decimal point too."""
         text = var.get().strip()
         if key == "currency":
             value = text[:4]
@@ -5692,6 +6595,7 @@ class StatsView:
         self.refresh(force=True)
 
     def cost_parts(self):
+        """The hourly cost split into (label, amount per hour, colour) parts."""
         c = self.app.s["costs"]
         wear = c["machine_price"] / c["lifetime_h"] if c["lifetime_h"] > 0 else 0.0
         return [("Electricity", c["power_kw"] * c["kwh_price"], AMBER),
@@ -5701,10 +6605,18 @@ class StatsView:
                 ("Other", c["other_h"], SLATE)]
 
     def money(self, v):
+        """An amount with the chosen currency symbol: "$1,234.50"."""
         return f"{self.app.s['costs']['currency']}{v:,.2f}"
 
     # ------------------------------------------------------------ refresh
     def refresh(self, force=False):
+        """Recalculate every number on every tab, then schedule itself again in
+        3 s. force=True redraws charts and lists even if nothing seems
+        changed (after a dropdown change or a theme switch).
+
+        The heavy part is turned into one structure first: `hourly`, the
+        running seconds per clock hour over all jobs, from which totals,
+        charts and the busiest hour are all summed."""
         if self._after:
             self.win.after_cancel(self._after)
             self._after = None
@@ -5800,10 +6712,14 @@ class StatsView:
 
     @staticmethod
     def set(card, value, sub):
+        """Fill in one number card."""
         card[0].configure(text=value)
         card[1].configure(text=sub)
 
     def spec(self, name, range_key, hourly, jobs, money):
+        """Build the chart spec (see Chart) for the chosen chart and range.
+        money=True turns run time into cost using the hourly rate. Returns an
+        "empty" spec with a hint when there's nothing to draw."""
         kind, group = (COST_CHARTS if money else USAGE_CHARTS)[name]
         rate = sum(v for _, v, _ in self.cost_parts())
         if kind == "breakdown":
@@ -5841,6 +6757,8 @@ class StatsView:
                         tips=[f"{d:%a %d %b %Y}" for d in ds])
         elif kind in ("time", "cumulative"):
             def key(d):
+                """The bucket a day falls in: itself, its week's Monday, or the
+                1st."""
                 if group == "week":
                     return d - timedelta(days=d.weekday())
                 if group == "month":
@@ -5910,18 +6828,22 @@ class StatsView:
 
     # -------------------------------------------------------- shared bits
     def panel(self, parent, **pack):
+        """A rounded card frame, packed with the given options (full width by
+        default)."""
         f = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=14, border_width=1,
                          border_color=CARD_BORDER)
         f.pack(**(pack or dict(fill="x", padx=5, pady=5)))
         return f
 
     def ghost_btn(self, parent, text, command, width=90):
+        """An outlined secondary button, as used on the Statistics tabs."""
         return ctk.CTkButton(parent, text=text, width=width, height=30, corner_radius=10,
                              fg_color="transparent", border_width=1, border_color=CARD_BORDER,
                              hover_color=CARD_BORDER, text_color=ACCENT,
                              font=self.app.font(12, "bold"), command=command)
 
     def label(self, parent, text, size=12, color=TEXT, bold=False, **kw):
+        """A left-aligned label in the app's font."""
         return ctk.CTkLabel(parent, text=text, text_color=color, anchor="w",
                             font=self.app.font(size, "bold" if bold else "normal"), **kw)
 
@@ -5943,6 +6865,9 @@ class StatsView:
         return t
 
     def tree_style(self):
+        """Make Tk's table widget (ttk.Treeview) match the app's colours. Called
+        again when the theme changes, since ttk styles don't follow
+        CustomTkinter by themselves."""
         st = ttk.Style(self.win)
         if st.theme_use() != "clam":
             st.theme_use("clam")
@@ -5968,6 +6893,9 @@ class StatsView:
                 combo.configure(values=names)
 
     def combo(self, parent, kind, var, width=150, on_pick=None):
+        """An editable dropdown for customers or materials: pick a remembered
+        name or type a new one, which is remembered when picked or when the
+        box loses focus. All boxes of one kind share the same list."""
         c = ctk.CTkComboBox(parent, variable=var, values=self.app.s[kind] or [""], width=width,
                             height=30, font=self.app.font(12), dropdown_font=self.app.font(12),
                             command=lambda v: (self.remember(kind, v), on_pick and on_pick()))
@@ -5977,6 +6905,9 @@ class StatsView:
 
     # --------------------------------------------------------------- jobs
     def build_jobs(self, tab):
+        """Jobs tab: the customer / material new jobs are tagged with, the table
+        of the last 500 jobs (newest first), and an editor that sets the
+        name, customer or material of the selected jobs."""
         self._combos, self._tag_rev = {}, 0
         self.tree_style()
         top = self.panel(tab)
@@ -6016,10 +6947,12 @@ class StatsView:
         self.jobs_status.pack(fill="x", padx=12, pady=(0, 8))
 
     def _set_current(self, key, var):
+        """Save the customer / material that new jobs get."""
         self.app.s[key] = var.get().strip()
         save_settings(self.app.s)
 
     def _job_selected(self):
+        """Selecting one job fills the editor with its tags, ready to change."""
         iids = self.jobs_tree.selection()
         if len(iids) == 1:                  # show its tags, ready to edit
             vals = self.jobs_tree.item(iids[0], "values")
@@ -6029,6 +6962,9 @@ class StatsView:
         self.jobs_status.configure(text=f"{n} job{'s' if n != 1 else ''} selected")
 
     def apply_tags(self):
+        """Apply the editor's non-empty boxes to every selected job. The table's
+        row ids are the jobs' start times, which is how RunLog.set_tag finds
+        them. The job still running is updated too."""
         iids = self.jobs_tree.selection()
         if not iids:
             self.jobs_status.configure(text="Pick one or more jobs in the list first.")
@@ -6053,6 +6989,9 @@ class StatsView:
         self.refresh(force=True)
 
     def refresh_jobs(self, jobs, per_s, force):
+        """Refill the jobs table when something in it changed (a job added, tags
+        edited, the theme, the cost rate, or the running job's time moved on
+        by 30 s), keeping the selection."""
         mode = ctk.get_appearance_mode()
         sig = (len(jobs), self._tag_rev, mode, round(per_s, 6),
                int(jobs[-1]["run"] // 30) if jobs else 0)
@@ -6078,6 +7017,9 @@ class StatsView:
 
     # ---------------------------------------------------------- customers
     def build_customers(self, tab):
+        """Customers tab: a month picker (or All time), PDF / Excel export of a
+        month, four number cards, and run time / cost per customer and per
+        material."""
         top = ctk.CTkFrame(tab, fg_color="transparent")
         top.pack(fill="x", padx=5, pady=(5, 0))
         today = date.today()
@@ -6109,6 +7051,9 @@ class StatsView:
                                                     ("cost", "Cost", 80, "e")], stretch=0)
 
     def month_data(self, jobs, rate):
+        """Totals and per-customer / per-material groups for the chosen month
+        (exporters.month_summary) or for all time (computed here the same
+        way)."""
         ym = self.months.get(self.month_var.get())
         c = self.app.s["costs"]["currency"]
         if ym:
@@ -6128,6 +7073,7 @@ class StatsView:
                     active_days=len(days))
 
     def refresh_customers(self, jobs, rate, force):
+        """Refill the Customers tab when its data changed."""
         sig = (self.month_var.get(), len(jobs), self._tag_rev, round(rate, 6),
                int(jobs[-1]["run"] // 30) if jobs else 0)
         if not force and self._sigs.get("cust") == sig:
@@ -6147,6 +7093,8 @@ class StatsView:
             b.configure(state="normal" if monthly else "disabled")
 
     def export_month(self, kind):
+        """Save the chosen month as a PDF or Excel report (beacon/exporters.py)
+        and open it."""
         ym = self.months.get(self.month_var.get())
         if not ym:
             return
@@ -6175,11 +7123,14 @@ class StatsView:
             pass
 
     # -------------------------------------------------------------- quote
+    # Quote calculator inputs: (setting key, label, unit). "$" is replaced by
+    # the chosen currency symbol.
     QUOTE_FIELDS = (("minutes", "Laser time per piece", "min"), ("qty", "Quantity", "pcs"),
                     ("material", "Material per piece", "$"), ("setup", "Setup / design (once)", "$"),
                     ("margin", "Markup", "%"))
 
     def build_quote(self, tab):
+        """Quote tab: inputs on the left, the price breakdown on the right."""
         left = self.panel(tab, side="left", fill="y", padx=5, pady=5)
         self.label(left, "Quote a job", 14, bold=True).pack(fill="x", padx=14, pady=(12, 0))
         self.label(left, "Machine time is priced at your Costs-tab rate.", 11, MUTED,
@@ -6206,6 +7157,8 @@ class StatsView:
         self.quote_note.pack(fill="x", padx=10, pady=8)
 
     def set_quote(self, key, var, entry):
+        """Validate and save one quote input (red border when it isn't a
+        number)."""
         try:
             value = float(var.get().replace(",", ".") or 0)
             if value < 0 or math.isnan(value) or math.isinf(value):
@@ -6219,6 +7172,9 @@ class StatsView:
         self.refresh_quote()
 
     def refresh_quote(self):
+        """The quote: machine = laser hours x the hourly cost from the Costs tab
+        your cost = machine + material x quantity + setup price = your cost +
+        markup %"""
         q = self.app.s["quote"]
         rate = sum(v for _, v, _ in self.cost_parts())
         qty = max(1, int(q["qty"]))
@@ -6240,6 +7196,7 @@ class StatsView:
 
     # -------------------------------------------------------- maintenance
     def build_maint(self, tab):
+        """Maintenance tab: total laser hours, one row per task, Add task."""
         head = ctk.CTkFrame(tab, fg_color="transparent")
         head.pack(fill="x", padx=5, pady=(5, 0))
         self.maint_total = self.label(head, "", 12, MUTED)
@@ -6253,6 +7210,8 @@ class StatsView:
         self.build_maint_rows()
 
     def build_maint_rows(self):
+        """One card per maintenance task: editable name and interval, Done, ✕,
+        and a progress bar towards the next service."""
         for w in self.maint_box.winfo_children():
             w.destroy()
         self.maint_rows = []
@@ -6284,6 +7243,7 @@ class StatsView:
         self.refresh_maint(time.time())
 
     def set_maint(self, t, key, var):
+        """Save a task's edited name or interval (intervals must be > 0)."""
         if key == "name":
             t["name"] = var.get()
         else:
@@ -6298,12 +7258,14 @@ class StatsView:
         self.refresh_maint(time.time())
 
     def maint_done(self, t):
+        """Done: the task was just serviced, so count from the current total."""
         t["last_h"] = round(self.app.runlog.total_run(time.time()) / 3600, 3)
         self.app.maint_alerted.discard(t["name"])
         save_settings(self.app.s)
         self.refresh_maint(time.time())
 
     def add_maint(self):
+        """Add a new task, counting from now."""
         self.app.s["maint"].append({"name": "New task", "every_h": 50.0,
                                     "last_h": round(self.app.runlog.total_run(time.time()) / 3600,
                                                     3)})
@@ -6311,11 +7273,13 @@ class StatsView:
         self.build_maint_rows()
 
     def remove_maint(self, t):
+        """Delete a task."""
         self.app.s["maint"].remove(t)
         save_settings(self.app.s)
         self.build_maint_rows()
 
     def refresh_maint(self, now):
+        """Update each task's bar and text: green, amber past 80%, red when due."""
         hours = self.app.runlog.total_run(now) / 3600
         self.maint_total.configure(text=f"Laser hours in total: {hours:.1f} h")
         for t, bar, info in self.maint_rows:
@@ -6330,6 +7294,8 @@ class StatsView:
                 info.configure(text=text, text_color=RED if due else MUTED)
 
     def export_csv(self):
+        """Usage tab: save every job as a CSV file (opens in Excel), with run
+        time, time spent paused or stopped, and cost."""
         path = filedialog.asksaveasfilename(parent=self.win, defaultextension=".csv",
                                             initialfile="laser_jobs.csv",
                                             filetypes=[("CSV file", "*.csv")])
@@ -6354,6 +7320,12 @@ class StatsView:
             messagebox.showerror(APP_NAME, f"Couldn't save the file:\n{e}", parent=self.win)
 
 
+# ---------------------------------------------------------------------------
+# Start-up. Only one copy of Beacon may run (two would fight over the Arduino's
+# port and send every notification twice). The running copy holds a local TCP
+# port; a second launch finds it taken, connects to it (which makes the first
+# copy show its window, see listen_for_launches) and exits. Dev mode uses its
+# own port so it can run next to the installed Beacon.
 INSTANCE_PORT = 47614      # local only; held by the running copy (the original uses 47613)
 if DEV:
     INSTANCE_PORT = 47615
@@ -6398,6 +7370,11 @@ def setup_logging():
 
 
 def main():
+    """Start Beacon: logging, the single-instance check, OCR (Windows OCR, else
+    Tesseract), then the App, which runs until quit.
+
+    Without any OCR the app can still work if LightBurn's API was paired
+    before; otherwise there's no way to read LightBurn, so it says why."""
     setup_logging()
     server = claim_single_instance()
     ocr, err = make_ocr()

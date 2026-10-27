@@ -3,6 +3,12 @@
 ; Bump MyAppVersion with APP_VERSION in laser_status_app.py for each release.
 ; v2 has its own name, AppId and taskbar ID, so it installs alongside the
 ; original Laser Status instead of replacing it.
+;
+; How an Inno Setup script reads: #define lines are constants used below as
+; {#Name}; [Setup] sets up the installer itself; [Files] is what gets copied;
+; [Icons] the shortcuts; [Run] what starts after installing; [UninstallRun]
+; and [Code] (Pascal script) extra steps when uninstalling. {app} is the
+; install folder, {autoprograms} the Start menu, {userappdata} %APPDATA%.
 
 #define MyAppName      "Beacon"
 #define MyAppVersion   "2.1.0"

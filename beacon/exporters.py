@@ -11,12 +11,20 @@ from xml.sax.saxutils import escape
 
 
 def _hm(sec):
+    """"2h 05m", or "12m 30s" under an hour."""
     sec = int(sec)
     h, m = divmod(sec // 60, 60)
     return f"{h}h {m:02d}m" if h else f"{m}m {sec % 60:02d}s"
 
 
 def month_summary(jobs, rate_per_hour, currency, year, month):
+    """Everything a monthly report shows, as one dict: totals, the busiest day,
+    one row per calendar day (laser time, jobs started, cost), groups by
+    customer / material / job name, and the month's jobs.
+
+    Laser time per day is taken from the running stretches ("seg"), split at
+    midnight, so a job running past midnight counts on both days. Job counts
+    go by the day a job started."""
     first = datetime(year, month, 1)
     last_day = calendar.monthrange(year, month)[1]
     end = first + timedelta(days=last_day)
@@ -38,6 +46,8 @@ def month_summary(jobs, rate_per_hour, currency, year, month):
         day_jobs[datetime.fromtimestamp(j["start"]).date()] += 1
 
     def group(key):
+        """[(name, jobs, run seconds, cost)] grouped by a job tag, biggest
+        first. Jobs without that tag are grouped as "(none)"."""
         out = {}
         for j in month_jobs:
             k = j.get(key) or "(none)"
@@ -63,7 +73,13 @@ def month_summary(jobs, rate_per_hour, currency, year, month):
 
 
 # ======================================================================== PDF
+# A minimal PDF writer: text in the two built-in Helvetica fonts (no font files
+# to embed), filled rectangles and lines. That's all the report needs, and it
+# keeps the app free of a PDF library.
 class _PDF:
+    """Coordinates are in points from the top-left (PDF itself counts from the
+    bottom-left, so y is flipped when drawing). Each page is a list of PDF
+    drawing operators, joined into a content stream by save()."""
     W, H = 595.0, 842.0           # A4 in points
 
     def __init__(self):
@@ -71,15 +87,20 @@ class _PDF:
         self.new_page()
 
     def new_page(self):
+        """Start a new page; later drawing goes onto it."""
         self.ops = []
         self.pages.append(self.ops)
 
     @staticmethod
     def _txt(s):
+        """Text made safe for a PDF string: limited to the Windows-1252
+        characters the built-in fonts have, with \ ( ) escaped."""
         s = str(s).encode("cp1252", "replace").decode("latin-1")
         return s.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
     def text(self, x, y, s, size=10, bold=False, color=(0.1, 0.12, 0.16), right=False):
+        """Draw text with its baseline at (x, y). right=True puts it so it ends
+        at x (approximately: real widths would need the font's metrics)."""
         if right:                 # rough right-align: Helvetica averages ~0.52 em per char
             x -= len(str(s)) * size * (0.56 if bold else 0.52)
         r, g, b = color
@@ -87,15 +108,21 @@ class _PDF:
                         f"{x:.1f} {self.H - y:.1f} Td ({self._txt(s)}) Tj ET")
 
     def rect(self, x, y, w, h, color):
+        """A filled rectangle with its top-left corner at (x, y)."""
         r, g, b = color
         self.ops.append(f"{r:.3f} {g:.3f} {b:.3f} rg {x:.1f} {self.H - y - h:.1f} {w:.1f} {h:.1f} re f")
 
     def line(self, x1, y1, x2, y2, color=(0.85, 0.86, 0.88), width=0.6):
+        """A straight line."""
         r, g, b = color
         self.ops.append(f"{r:.3f} {g:.3f} {b:.3f} RG {width} w {x1:.1f} {self.H - y1:.1f} m "
                         f"{x2:.1f} {self.H - y2:.1f} l S")
 
     def save(self, path):
+        """Write the PDF file. A PDF is a list of numbered objects (catalog,
+        page tree, fonts, then a content stream and a page object per page)
+        followed by a cross-reference table giving each object's byte offset,
+        which is why the offsets are recorded as the file is built."""
         objs = ["<< /Type /Catalog /Pages 2 0 R >>", None,
                 "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
                 "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>"]
@@ -129,11 +156,16 @@ MUTED = (0.45, 0.48, 0.55)
 
 
 def write_month_pdf(path, m, app_name="Beacon"):
+    """A one-or-more page A4 report from month_summary(): header, four number
+    tiles, a bar chart of laser time per day, then tables day by day and by
+    customer, material and job name (new pages are started as needed). Costs
+    show as "-" when no cost rate is set."""
     pdf = _PDF()
     cur = m["currency"]
     money = (lambda v: f"{cur}{v:,.2f}") if m["rate"] > 0 else (lambda v: "-")
 
     def header(title):
+        """The dark band at the top of every page."""
         pdf.rect(0, 0, pdf.W, 70, (0.09, 0.10, 0.13))
         pdf.text(40, 32, f"{app_name}  -  Monthly report", 18, True, (1, 1, 1))
         pdf.text(40, 54, title, 11, False, (0.75, 0.78, 0.84))
@@ -167,6 +199,9 @@ def write_month_pdf(path, m, app_name="Beacon"):
     pdf.text(cx + cw, cy - 4, f"tallest bar {_hm(top)}", 8, False, MUTED, right=True)
 
     def table(y, title, cols, rows):
+        """A titled table starting at height y. cols: [(heading, width)]. Text
+        columns are left-aligned, numbers right-aligned. Returns the y below
+        it."""
         pdf.text(40, y, title, 11, True)
         y += 18
         xs = [40] + [40 + sum(w for _, w in cols[:i + 1]) for i in range(len(cols) - 1)]
@@ -209,6 +244,7 @@ def write_month_pdf(path, m, app_name="Beacon"):
 
 # ====================================================================== XLSX
 def _col(i):
+    """Excel column letters for a 0-based index: 0 -> A, 25 -> Z, 26 -> AA."""
     s = ""
     i += 1
     while i:
@@ -218,6 +254,9 @@ def _col(i):
 
 
 def _sheet_xml(rows):
+    """One worksheet's XML. The first row is bold (style 1) and frozen so it
+    stays visible when scrolling. Numbers are stored as numbers (so Excel can
+    sum them) and everything else as inline text."""
     out = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
            '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" '
@@ -239,6 +278,11 @@ def _sheet_xml(rows):
     return "".join(out)
 
 
+# An .xlsx file is a zip of XML files: [Content_Types].xml lists the parts,
+# _rels/.rels points to the workbook, xl/workbook.xml lists the sheets,
+# xl/_rels/workbook.xml.rels links each sheet's file, styles.xml defines the
+# normal and bold fonts, and xl/worksheets/sheetN.xml holds the cells. These are
+# the minimum parts Excel, LibreOffice and Google Sheets all open.
 def write_xlsx(path, sheets):
     """sheets: [(name, rows)] where rows[0] is the header row."""
     ct = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
@@ -283,6 +327,9 @@ def write_xlsx(path, sheets):
 
 
 def write_month_xlsx(path, m):
+    """An Excel workbook from month_summary(): sheets Days (with a total row),
+    Jobs, Customers and Materials. Times are in hours or minutes as numbers,
+    so they can be used in formulas."""
     cur = m["currency"]
     hours = lambda s: round(s / 3600, 3)
     days = [["Day", "Laser on (h)", "Jobs", f"Cost ({cur})"]] + [

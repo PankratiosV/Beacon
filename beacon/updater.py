@@ -18,6 +18,8 @@ import urllib.request
 
 def version_key(v):
     """'2.1.0' > '2.0.10' > '2.0.0' > '2.0.0-dev' (pre-releases sort below the release)."""
+    # A sortable tuple: up to four numbers, then 1 for a release or 0 for a
+    # pre-release ("-dev", "-beta"), so 2.1.0-beta < 2.1.0.
     main, _, pre = str(v).strip().lstrip("vV").partition("-")
     nums = [int(x) for x in re.findall(r"\d+", main)][:4]
     nums += [0] * (4 - len(nums))
@@ -63,6 +65,8 @@ def download(url, progress=None, timeout=30):
                     progress(done / total if total else None)
     except (urllib.error.URLError, OSError) as e:
         raise RuntimeError("The download failed. Try again later.") from e
+    # Downloaded to a .part file first, so a broken download never leaves a
+    # half-written installer under the real name.
     os.replace(dest + ".part", dest)
     return dest
 
@@ -70,5 +74,9 @@ def download(url, progress=None, timeout=30):
 def run_installer(path):
     """Starts the downloaded installer quietly; it closes the running app,
     upgrades it and starts it again."""
+    # Inno Setup switches: /SILENT shows only a progress bar, /SP- skips the
+    # "This will install..." question, /CLOSEAPPLICATIONS and
+    # /RESTARTAPPLICATIONS close Beacon and start it again afterwards,
+    # /NORESTART never reboots Windows.
     subprocess.Popen([path, "/SILENT", "/SP-", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS",
                       "/NORESTART"], close_fds=True)
