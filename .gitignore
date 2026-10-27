@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+# Shortcuts hold this PC's paths; make_shortcut.py recreates them
+*.lnk
+# Arduino IDE / PyInstaller build output, and the finished installers
+build/
+dist/
+installer/Output/
+# Dev mode's own settings, stats and logs (laser_status_app.py --dev)
+.devdata/

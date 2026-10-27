@@ -1,0 +1,16 @@
+# Exact versions bundled into the installer (the ones the app is tested with).
+# build_installer.bat installs these into build\buildenv automatically.
+pyinstaller==6.22.3
+customtkinter==6.0.0
+darkdetect==0.8.0
+pillow==12.3.0
+psutil==7.2.2
+pyserial==3.5
+pywin32==312
+winrt-runtime==3.2.1
+winrt-Windows.Foundation==3.2.1
+winrt-Windows.Foundation.Collections==3.2.1
+winrt-Windows.Globalization==3.2.1
+winrt-Windows.Graphics.Imaging==3.2.1
+winrt-Windows.Media.Ocr==3.2.1
+winrt-Windows.Storage.Streams==3.2.1
