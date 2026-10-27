@@ -1,4 +1,4 @@
-# Beacon — Live Laser Status App for LightBurn
+# Beacon — Live Laser Status App for LightBurn - BETA
 
 Beacon watches [LightBurn](https://lightburnsoftware.com) and shows what your laser is doing —
 **Running, Paused, Framing, Ready or Disconnected** — in a small window or floating pill, on a
