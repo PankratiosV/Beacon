@@ -60,7 +60,7 @@ def main():
     if not os.path.exists(PYTHONW):
         sys.exit(f"Can't find pythonw.exe next to {sys.executable}")
     programs = shell.SHGetFolderPath(0, shellcon.CSIDL_PROGRAMS, None, 0)
-    # Started from inside a packaged app (e.g. the Claude desktop app), writes
+    # Started from inside a packaged (MSIX / Store) app, writes
     # under %APPDATA% are redirected into that app's own folder; going through
     # \\localhost\C$ puts the Start menu shortcut where Windows looks for it.
     if programs[1:3] == ":\\" and os.path.isdir("\\\\localhost\\" + programs[0] + "$"):
