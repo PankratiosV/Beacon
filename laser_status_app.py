@@ -150,12 +150,30 @@ def _smooth_wheel():
     """CustomTkinter scrolls a page once per mouse-wheel tick. A fast spin sends
     dozens of ticks in a burst and Windows never finishes redrawing the page's
     widgets between jumps, so text smears. Gather a burst into one jump at most
-    every WHEEL_MS instead (same distance overall)."""
+    every WHEEL_MS instead (same distance overall), and paint what each jump
+    uncovered straight away (paint_now)."""
     from customtkinter.windows.widgets.ctk_scrollable_frame import CTkScrollableFrame
     original = CTkScrollableFrame._mouse_wheel_all
+    original_init = CTkScrollableFrame.__init__
     # 16 ms is about one screen refresh at 60 Hz: the page moves at most once
     # per frame, which is as smooth as the eye can see anyway.
     WHEEL_MS = 16
+    RDW_ALLCHILDREN, RDW_UPDATENOW = 0x80, 0x100
+
+    def paint_now(canvas):
+        """Windows moves a scrolled page at once but paints the parts it
+        uncovered at low priority, behind further wheel ticks, so text left
+        trails. Ask for just those pending paints now. (Repainting the whole
+        page instead, RDW_INVALIDATE, also cured the trails but was too
+        slow.) Measured on Settings with every category open, a fast spin:
+        frames on screen 2-4 % wrong pixels (up to 21 %) before, 0.2 % (up to
+        1.4 %) after."""
+        if not sys.platform.startswith("win"):
+            return
+        canvas.update_idletasks()               # Tk moves the page...
+        ctypes.windll.user32.RedrawWindow(canvas.winfo_id(), None, None,
+                                          RDW_ALLCHILDREN | RDW_UPDATENOW)
+        canvas.update_idletasks()               # ...and draws what Windows asked for
 
     def flush(self):
         """Apply all the wheel ticks gathered since the last jump in one scroll.
@@ -168,8 +186,20 @@ def _smooth_wheel():
         try:
             if steps and self._parent_canvas.yview() != (0.0, 1.0):
                 self._parent_canvas.yview("scroll", steps, "units")
+                paint_now(self._parent_canvas)
         except tk.TclError:             # the page was closed meanwhile
             pass
+
+    def init(self, *args, **kwargs):
+        """Dragging the scrollbar moves the page too: paint after each move."""
+        original_init(self, *args, **kwargs)
+        if self._orientation == "vertical":
+            canvas = self._parent_canvas
+
+            def drag(*how):
+                canvas.yview(*how)
+                paint_now(canvas)
+            self._scrollbar.configure(command=drag)
 
     def wheel(self, event):
         """Replacement wheel handler: only adds up the ticks and schedules one
@@ -186,6 +216,7 @@ def _smooth_wheel():
     # Monkey-patch: every scrollable page in the app now uses the gathered
     # version. Done once at import time, before any window exists.
     CTkScrollableFrame._mouse_wheel_all = wheel
+    CTkScrollableFrame.__init__ = init
 
 
 _smooth_wheel()
@@ -1892,6 +1923,120 @@ def pick(pair):
     return pair[1] if ctk.get_appearance_mode() == "Dark" else pair[0]
 
 
+# Light widgets for long pages. CustomTkinter draws every frame and label
+# (even an invisible one) with its own canvas, so each costs two or three
+# windows; with every Settings category open that was ~650 windows, which took
+# 2.5 s to show and painted slowly when scrolled. PlainFrame and PlainLabel are
+# one plain Tk window each, used for layout and text; buttons, switches and
+# menus stay CustomTkinter. Both follow the Light / Dark switch and display
+# scaling, and answer cget("bg") with their (light, dark) pair, so a
+# CustomTkinter widget placed inside one still picks the right corner colour.
+def as_pair(color):
+    """A colour as a (light, dark) pair."""
+    return tuple(color) if isinstance(color, (tuple, list)) else (color, color)
+
+
+def background_of(widget):
+    """The (light, dark) colour behind anything placed in `widget`: the same
+    search CustomTkinter makes for its "transparent" colour."""
+    while widget is not None:
+        if isinstance(widget, (PlainFrame, PlainLabel)):
+            return widget.bg_pair
+        if isinstance(widget, (ctk.CTkScrollableFrame, ctk.CTkBaseClass, ctk.CTk,
+                               ctk.CTkToplevel)):
+            fg = widget.cget("fg_color")
+            if fg not in (None, "transparent"):
+                return as_pair(fg)
+            # a scrollable frame sits in a canvas in a frame: look past both
+            widget = (widget.master.master.master if isinstance(widget, ctk.CTkScrollableFrame)
+                      else widget.master)
+            continue
+        return as_pair(widget.cget("bg"))
+    return BG
+
+
+class PlainFrame(tk.Frame):
+    """A see-through layout frame: one window, coloured like its parent."""
+
+    def __init__(self, master, height=None, **kw):
+        self.bg_pair = background_of(master)
+        super().__init__(master, bd=0, highlightthickness=0, bg=pick(self.bg_pair), **kw)
+        if height:                      # a spacer: scale it like CustomTkinter would
+            self.configure(height=round(height * ctk.ScalingTracker.get_widget_scaling(self)))
+        ctk.AppearanceModeTracker.add(self._appearance, self)
+
+    def _appearance(self, mode):
+        """Light / Dark switched: recolour."""
+        self.configure(bg=self.bg_pair[1] if mode == "Dark" else self.bg_pair[0])
+
+    def cget(self, key):
+        """The background as a (light, dark) pair, for CustomTkinter widgets inside."""
+        if key in ("bg", "background"):
+            return self.bg_pair
+        return super().cget(key)
+
+    def destroy(self):
+        ctk.AppearanceModeTracker.remove(self._appearance)
+        super().destroy()
+
+
+class PlainLabel(tk.Label):
+    """Text in one window, taking the same font, text_color, wraplength,
+    anchor and justify arguments as CTkLabel (configure too), so either can
+    be used."""
+
+    def __init__(self, master, text="", font=None, text_color=TEXT, wraplength=0,
+                 anchor="w", justify="left", **kw):
+        self.bg_pair = background_of(master)
+        self._color, self._font, self._wrap = as_pair(text_color), font, wraplength
+        super().__init__(master, text=text, anchor=anchor, justify=justify, bd=0, padx=0,
+                         pady=0, highlightthickness=0, bg=pick(self.bg_pair),
+                         fg=pick(self._color), **kw)
+        self._scale(ctk.ScalingTracker.get_widget_scaling(self))
+        ctk.AppearanceModeTracker.add(self._appearance, self)
+        ctk.ScalingTracker.add_widget(self._rescale, self)
+
+    def _scale(self, scaling):
+        """Font size and wrap width in pixels for this display's scaling."""
+        self._scaling = scaling
+        font = self._font or ctk.CTkFont(family=FONT, size=12)
+        super().configure(font=font.create_scaled_tuple(scaling),
+                          wraplength=round(self._wrap * scaling))
+
+    def _rescale(self, widget_scaling, window_scaling):
+        """The window moved to a screen with different scaling."""
+        self._scale(widget_scaling)
+
+    def _appearance(self, mode):
+        """Light / Dark switched: recolour."""
+        i = 1 if mode == "Dark" else 0
+        super().configure(bg=self.bg_pair[i], fg=self._color[i])
+
+    def configure(self, **kw):
+        """Like CTkLabel.configure: text_color, font and wraplength included."""
+        if "text_color" in kw:
+            self._color = as_pair(kw.pop("text_color"))
+            kw["fg"] = pick(self._color)
+        if "font" in kw or "wraplength" in kw:
+            self._font = kw.pop("font", self._font)
+            self._wrap = kw.pop("wraplength", self._wrap)
+            self._scale(self._scaling)
+        if kw:
+            super().configure(**kw)
+
+    def cget(self, key):
+        if key in ("bg", "background"):
+            return self.bg_pair
+        if key == "text_color":
+            return self._color
+        return super().cget(key)
+
+    def destroy(self):
+        ctk.AppearanceModeTracker.remove(self._appearance)
+        ctk.ScalingTracker.remove_widget(self._rescale, self)
+        super().destroy()
+
+
 # ===========================================================================
 # Job-finished chime: Windows Media Player's engine (MP3, WAV, WMA, any file
 # name; part of Windows, driven through pywin32). The older MCI player is the
@@ -2491,8 +2636,11 @@ class App:
         self._mark_reports_sent()           # reports switched on but never sent: start fresh
         self.root.after(5000, self.check_reports)
         self.root.after(15000, lambda: self.check_updates(auto=True))
-        # Settings is the page opened most: build it just after the window shows
-        self.root.after(1200, lambda: self.ensure_page("settings"))
+        # Settings is the page opened most: build it just after the window shows,
+        # and lay it out under the Home page a moment later (park_settings), so
+        # it opens at once
+        self.root.after(1200, self._prebuild_settings)
+        self.root.bind("<Configure>", self._root_resized, add="+")
         # Always start in the full window (the pill keeps its remembered spot);
         # started with Windows: go straight to the small pill
         self.s["compact"] = False
@@ -2582,18 +2730,33 @@ class App:
         self.ard_dot.pack(side="right", padx=(0, 4))
 
     def section(self, master, title, key=None):
-        """A titled card. With a key (Settings page) it's a category instead: no
-        title line (the category page shows it); see open_category()."""
+        """A titled card. With a key (Settings page) it's a category: a heading
+        with its short description and ▲ ▼ to move it, above the card. It's
+        laid out by apply_settings_order(), in the order the user chose."""
         if key:
-            holder = ctk.CTkFrame(master, fg_color="transparent")
+            holder = PlainFrame(master)
             self.settings_sections[key] = holder
             self.section_titles[key] = title
+            head = PlainFrame(holder)
+            head.pack(fill="x", padx=(8, 2), pady=(20, 8))
+            arrows = {}
+            for sym, step in (("▼", 1), ("▲", -1)):
+                arrows[step] = ctk.CTkButton(
+                    head, text=sym, width=26, height=24, corner_radius=6,
+                    fg_color="transparent", hover_color=CARD_BORDER, text_color=MUTED,
+                    text_color_disabled=CARD_BORDER, font=self.font(10),
+                    command=lambda s=step: self.move_section(key, s))
+                arrows[step].pack(side="right")
+            self.section_arrows[key] = arrows
+            PlainLabel(head, text=title, font=self.font(14, "bold")).pack(fill="x")
+            PlainLabel(head, text=self.CATEGORY_HINTS.get(key, ""), font=self.font(11),
+                       text_color=MUTED).pack(fill="x", pady=(1, 0))
             box = ctk.CTkFrame(holder, fg_color=CARD, corner_radius=16, border_width=1,
                                border_color=CARD_BORDER)
-            box.pack(fill="x", pady=(6, 0))
+            box.pack(fill="x")
             return box
-        ctk.CTkLabel(master, text=title.upper(), font=self.font(11, "bold"),
-                     text_color=MUTED, anchor="w").pack(fill="x", padx=6, pady=(14, 6))
+        PlainLabel(master, text=title.upper(), font=self.font(11, "bold"),
+                   text_color=MUTED).pack(fill="x", padx=6, pady=(14, 6))
         box = ctk.CTkFrame(master, fg_color=CARD, corner_radius=16, border_width=1,
                            border_color=CARD_BORDER)
         box.pack(fill="x")
@@ -2639,39 +2802,25 @@ class App:
         return order
 
     def apply_settings_order(self):
-        """(Re)build the category list: one row per category, in order."""
-        for w in self.category_list.winfo_children():
-            w.destroy()
+        """Lay every category out, in the saved order, above the footer."""
         order = self.settings_order()
+        for key in order:
+            self.settings_sections[key].pack_forget()
+        for key in order:
+            self.settings_sections[key].pack(fill="x", before=self.settings_footer)
+        self._update_section_arrows(order)
+
+    def _update_section_arrows(self, order):
+        """Grey out ▲ on the first category and ▼ on the last."""
         for n, key in enumerate(order):
-            row = ctk.CTkFrame(self.category_list, fg_color=CARD, corner_radius=12,
-                               border_width=1, border_color=CARD_BORDER)
-            row.pack(fill="x", pady=3)
-            ctk.CTkLabel(row, text="›", font=self.font(18), text_color=MUTED,
-                         width=16).pack(side="right", padx=(0, 10))
-            for sym, step in (("▼", 1), ("▲", -1)):
-                last = (step == -1 and n == 0) or (step == 1 and n == len(order) - 1)
-                ctk.CTkButton(row, text=sym, width=26, height=24, corner_radius=6,
-                              fg_color="transparent", hover_color=CARD_BORDER,
-                              text_color=MUTED, font=self.font(10),
-                              state="disabled" if last else "normal",
-                              command=lambda k=key, s=step: self.move_section(k, s)
-                              ).pack(side="right")
-            text = ctk.CTkFrame(row, fg_color="transparent")
-            text.pack(side="left", fill="x", expand=True, padx=12, pady=7)
-            labels = [ctk.CTkLabel(text, text=self.section_titles[key], font=self.font(13),
-                                   text_color=TEXT, anchor="w"),
-                      ctk.CTkLabel(text, text=self.CATEGORY_HINTS.get(key, ""),
-                                   font=self.font(11), text_color=MUTED, anchor="w")]
-            for lbl in labels:
-                lbl.pack(fill="x")
-            for w in (row, text, *labels):
-                w.configure(cursor="hand2")
-                w.bind("<Button-1>", lambda e, k=key: self.open_category(k))
+            arrows = self.section_arrows[key]
+            arrows[-1].configure(state="disabled" if n == 0 else "normal")
+            arrows[1].configure(state="disabled" if n == len(order) - 1 else "normal")
 
     def move_section(self, key, step):
-        """Move a category one place up (step=-1) or down (step=1) in the list
-        and save the new order (the ▲ ▼ buttons)."""
+        """Move a category one place up (step=-1) or down (step=1) and save the
+        new order (the ▲ ▼ buttons). Only that category is re-placed, and the
+        page scrolls with it, so it stays under the mouse for another click."""
         order = self.settings_order()
         i = order.index(key)
         j = i + step
@@ -2680,7 +2829,18 @@ class App:
         order[i], order[j] = order[j], order[i]
         self.s["settings_order"] = order
         save_settings(self.s)
-        self.apply_settings_order()
+        holder = self.settings_sections[key]
+        canvas = self.settings_body._parent_canvas
+        before = holder.winfo_y()
+        if j + 1 < len(order):
+            holder.pack_configure(before=self.settings_sections[order[j + 1]])
+        else:
+            holder.pack_configure(after=self.settings_sections[order[j - 1]])
+        self._update_section_arrows(order)
+        canvas.update_idletasks()
+        height = max(holder.master.winfo_height(), 1)
+        top = canvas.canvasy(0) + holder.winfo_y() - before
+        canvas.yview_moveto(max(0.0, top / height))
 
     def reset_settings_order(self):
         """Back to the default order (SETTINGS_ORDER)."""
@@ -2688,41 +2848,22 @@ class App:
         save_settings(self.s)
         self.apply_settings_order()
 
-    def open_category(self, key):
-        """Show just one category's settings."""
-        for holder in self.settings_sections.values():
-            holder.pack_forget()
-        self.settings_sections[key].pack(fill="x")
-        self.category_title.configure(text=self.section_titles[key])
-        self.settings_list_view.pack_forget()
-        self.settings_cat_view.pack(fill="both", expand=True)
-        self.settings_category = key
-        self.settings_body._parent_canvas.yview_moveto(0)
-
-    def show_category_list(self):
-        """Back from one category to the list of categories."""
-        self.settings_cat_view.pack_forget()
-        self.settings_list_view.pack(fill="both", expand=True)
-        self.settings_category = None
-
     def row(self, box, label, sub=None):
         """A settings row: a label (and optional grey explanation) on the left.
         Returns the row frame so the caller can pack a control on its right."""
-        r = ctk.CTkFrame(box, fg_color="transparent")
-        r.pack(fill="x", padx=14, pady=8)
-        txt = ctk.CTkFrame(r, fg_color="transparent")
+        r = PlainFrame(box)
+        r.pack(fill="x", padx=14, pady=9)
+        txt = PlainFrame(r)
         txt.pack(side="left", fill="x", expand=True)
-        ctk.CTkLabel(txt, text=label, font=self.font(13), text_color=TEXT,
-                     anchor="w").pack(fill="x")
+        PlainLabel(txt, text=label, font=self.font(13)).pack(fill="x", pady=(2, 2))
         if sub:
-            ctk.CTkLabel(txt, text=sub, font=self.font(11), text_color=MUTED,
-                         anchor="w", justify="left", wraplength=200).pack(fill="x")
+            PlainLabel(txt, text=sub, font=self.font(11), text_color=MUTED,
+                       wraplength=200).pack(fill="x", pady=(0, 2))
         return r
 
     def note(self, box, text, pady=(0, 8)):
         """A paragraph of small grey explanatory text inside a card."""
-        lbl = ctk.CTkLabel(box, text=text, font=self.font(11), text_color=MUTED, anchor="w",
-                           justify="left", wraplength=300)
+        lbl = PlainLabel(box, text=text, font=self.font(11), text_color=MUTED, wraplength=300)
         lbl.pack(fill="x", padx=14, pady=pady)
         return lbl
 
@@ -2745,8 +2886,8 @@ class App:
 
     def entry_row(self, box, key, label, secret=False, kind=str, placeholder=""):
         """A labelled text box saved as you type (kind=int/float for numbers)."""
-        ctk.CTkLabel(box, text=label, font=self.font(11), text_color=MUTED,
-                     anchor="w").pack(fill="x", padx=14, pady=(6, 0))
+        PlainLabel(box, text=label, font=self.font(11), text_color=MUTED).pack(
+            fill="x", padx=14, pady=(8, 2))
         var = ctk.StringVar(value="" if self.s[key] in (None, "") else str(self.s[key]))
 
         def changed(*_):
@@ -2814,43 +2955,24 @@ class App:
         return var
 
     def build_settings_page(self):
-        """Settings: a list of categories; picking one shows just that category
-        (one long scrolling page was slow to repaint and trailed when scrolled)."""
-        p = self.settings_page = ctk.CTkFrame(self.root, fg_color="transparent")
-        self.settings_category = None
-
-        def header(parent, back_text, back, title):
-            """"← Back" on the left, a title on the right. Returns the title
-            label so the category view can change it."""
-            head = ctk.CTkFrame(parent, fg_color="transparent")
-            head.pack(fill="x", padx=18, pady=(16, 0))
-            ctk.CTkButton(head, text="\u2190  " + back_text, width=80, height=32,
-                          corner_radius=10, fg_color="transparent", hover_color=CARD_BORDER,
-                          text_color=ACCENT, font=self.font(13, "bold"),
-                          command=back).pack(side="left")
-            label = ctk.CTkLabel(head, text=title, font=self.font(15, "bold"), text_color=TEXT)
-            label.pack(side="right", padx=4)
-            return label
-
-        # The category list
-        lv = self.settings_list_view = ctk.CTkFrame(p, fg_color="transparent")
-        header(lv, "Done", lambda: (self.show_category_list(), self.show_page("status")),
-               "Settings")
-        lbody = ctk.CTkScrollableFrame(lv, fg_color="transparent")
-        lbody.pack(fill="both", expand=True, padx=12, pady=(4, 12))
-        self.category_list = ctk.CTkFrame(lbody, fg_color="transparent")
-        self.category_list.pack(fill="x", pady=(6, 0))
-        lv.pack(fill="both", expand=True)
-
-        # One category
-        cv = self.settings_cat_view = ctk.CTkFrame(p, fg_color="transparent")
-        self.category_title = header(cv, "Settings", self.show_category_list, "")
-        body = ctk.CTkScrollableFrame(cv, fg_color="transparent")
+        """Settings: every category open on one scrolling page, each under its
+        heading, in the order the user chose (▲ ▼). Layout and text are
+        PlainFrame / PlainLabel, which keeps the long page quick to show and
+        to scroll."""
+        p = self.settings_page = PlainFrame(self.root)      # placed, see park_settings
+        head = PlainFrame(p)
+        head.pack(fill="x", padx=18, pady=(16, 0))
+        ctk.CTkButton(head, text="\u2190  Done", width=80, height=32, corner_radius=10,
+                      fg_color="transparent", hover_color=CARD_BORDER, text_color=ACCENT,
+                      font=self.font(13, "bold"),
+                      command=lambda: self.show_page("status")).pack(side="left")
+        PlainLabel(head, text="Settings", font=self.font(15, "bold")).pack(side="right", padx=4)
+        body = ctk.CTkScrollableFrame(p, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=12, pady=(4, 12))
         self.settings_body = body
-        self.settings_sections, self.section_titles = {}, {}
+        self.settings_sections, self.section_titles, self.section_arrows = {}, {}, {}
 
-        # Categories are built in any order; apply_settings_order() lists them.
+        # Categories are built in any order; apply_settings_order() lays them out.
         # --- Display
         # Every category below follows the same pattern: box = self.section(...)
         # for the card, then rows built with the helpers above. Each control
@@ -2874,7 +2996,7 @@ class App:
                       font=self.font(12),
                       command=lambda: play_chime(self.s["chime_file"])).pack(side="right",
                                                                               padx=(0, 2))
-        self.chime_name = ctk.CTkLabel(box, text="", font=self.font(11), text_color=MUTED,
+        self.chime_name = PlainLabel(box, text="", font=self.font(11), text_color=MUTED,
                                        anchor="w")
         self.chime_name.pack(fill="x", padx=14, pady=(0, 8))
         self.show_chime_name()
@@ -2884,7 +3006,7 @@ class App:
                                      command=self.set_appearance, font=self.font(12))
         seg.set(self.s["appearance"])
         seg.pack(side="right")
-        ctk.CTkFrame(box, height=4, fg_color="transparent").pack()
+        PlainFrame(box, height=4).pack()
 
         # --- Detection: screen reading or LightBurn's API
         box = self.section(body, "Detection", "detection")
@@ -2926,7 +3048,7 @@ class App:
 
         # --- Telegram bot
         box = self.section(body, "Telegram bot", "telegram")
-        ctk.CTkLabel(box, text="In Telegram, message @BotFather, send /newbot and paste the "
+        PlainLabel(box, text="In Telegram, message @BotFather, send /newbot and paste the "
                                "token it gives you below. Then send your new bot any message "
                                "and press Find.",
                      font=self.font(11), text_color=MUTED, anchor="w", justify="left",
@@ -2935,14 +3057,14 @@ class App:
         self.tg_token_var = ctk.StringVar(value=self.s["tg_token"])
         self.tg_token_var.trace_add("write", lambda *_: self._set_text_setting(
             "tg_token", self.tg_token_var))
-        ctk.CTkLabel(box, text="Bot token", font=self.font(11), text_color=MUTED,
+        PlainLabel(box, text="Bot token", font=self.font(11), text_color=MUTED,
                      anchor="w").pack(fill="x", padx=14, pady=(8, 0))
         ctk.CTkEntry(box, textvariable=self.tg_token_var, show="•", height=30,
                      font=self.font(12)).pack(fill="x", padx=14)
 
-        ctk.CTkLabel(box, text="Chat ID", font=self.font(11), text_color=MUTED,
+        PlainLabel(box, text="Chat ID", font=self.font(11), text_color=MUTED,
                      anchor="w").pack(fill="x", padx=14, pady=(8, 0))
-        chat_row = ctk.CTkFrame(box, fg_color="transparent")
+        chat_row = PlainFrame(box)
         chat_row.pack(fill="x", padx=14)
         self.tg_chat_var = ctk.StringVar(value=str(self.s["tg_chat"]))
         self.tg_chat_var.trace_add("write", lambda *_: self._set_text_setting(
@@ -2952,24 +3074,24 @@ class App:
         ctk.CTkEntry(chat_row, textvariable=self.tg_chat_var, height=30,
                      font=self.font(12)).pack(side="left", fill="x", expand=True, padx=(0, 6))
 
-        test_row = ctk.CTkFrame(box, fg_color="transparent")
+        test_row = PlainFrame(box)
         test_row.pack(fill="x", padx=14, pady=(8, 0))
         ctk.CTkButton(test_row, text="Send test", width=90, height=30, corner_radius=8,
                       fg_color="transparent", border_width=1, border_color=CARD_BORDER,
                       hover_color=CARD_BORDER, text_color=ACCENT, font=self.font(12, "bold"),
                       command=self.send_test_notification).pack(side="left")
-        self.tg_status = ctk.CTkLabel(box, text="", font=self.font(11), text_color=MUTED,
+        self.tg_status = PlainLabel(box, text="", font=self.font(11), text_color=MUTED,
                                       anchor="w", justify="left", wraplength=300)
         self.tg_status.pack(fill="x", padx=14, pady=(4, 0))
         self.switch_row(box, "tg_commands", "Telegram commands",
                         "Reply to /status, /today, /relays and more from your phone")
-        ctk.CTkFrame(box, height=4, fg_color="transparent").pack()
+        PlainFrame(box, height=4).pack()
 
         # --- Notifications
         box = self.section(body, "Notifications", "notifications")
         self.switch_row(box, "notify_pc", "Windows notifications",
                         "Pop-ups in the corner of the screen", on_change=self._pc_notify_changed)
-        ctk.CTkLabel(box, text="Notify me when", font=self.font(13), text_color=TEXT,
+        PlainLabel(box, text="Notify me when", font=self.font(13), text_color=TEXT,
                      anchor="w").pack(fill="x", padx=14, pady=(10, 2))
         for key, label in NOTIFY_EVENTS:
             var = ctk.BooleanVar(value=bool(self.s[f"notify_{key}"]))
@@ -2982,10 +3104,10 @@ class App:
         hours = {h: f"{h:02d}:00" for h in range(24)}
         self.switch_row(box, "quiet_on", "Quiet hours",
                         "Only safety alarms and disconnects get through")
-        q = ctk.CTkFrame(box, fg_color="transparent")
+        q = PlainFrame(box)
         q.pack(fill="x", padx=14, pady=(0, 6))
         for label, key in (("from", "quiet_start"), ("to", "quiet_end")):
-            ctk.CTkLabel(q, text=label, font=self.font(12),
+            PlainLabel(q, text=label, font=self.font(12),
                          text_color=MUTED).pack(side="left", padx=(0, 6))
             om = ctk.CTkOptionMenu(q, values=list(hours.values()), width=84, height=28,
                                    font=self.font(12), dropdown_font=self.font(12),
@@ -2997,11 +3119,11 @@ class App:
         self.open_row(box, "Alerts & safety", "Long jobs, laser free, sensors, unattended runs",
                       "safety")
         self.open_row(box, "Phone & Wi-Fi", "Phone dashboard and the Wi-Fi light", "remote")
-        ctk.CTkFrame(box, height=6, fg_color="transparent").pack()
+        PlainFrame(box, height=6).pack()
 
         # --- Usage reports
         box = self.section(body, "Usage reports", "reports")
-        ctk.CTkLabel(box, text="Laser-on time (running only, pauses left out), with jobs, cost "
+        PlainLabel(box, text="Laser-on time (running only, pauses left out), with jobs, cost "
                                "and how it compares with the period before.",
                      font=self.font(11), text_color=MUTED, anchor="w", justify="left",
                      wraplength=300).pack(fill="x", padx=14, pady=(10, 0))
@@ -3018,11 +3140,11 @@ class App:
             """A line of words and dropdowns under a report switch, e.g. "on
             [Sunday] at [18:00]". parts: (kind, "text") or (kind, (setting
             key, choices, current choice, text -> value))."""
-            line = ctk.CTkFrame(box, fg_color="transparent")
+            line = PlainFrame(box)
             line.pack(fill="x", padx=14, pady=(0, 6))
             for kind, item in parts:
                 if isinstance(item, str):
-                    ctk.CTkLabel(line, text=item, font=self.font(12),
+                    PlainLabel(line, text=item, font=self.font(12),
                                  text_color=MUTED).pack(side="left", padx=(0, 6))
                     continue
                 key, values, current, parse = item
@@ -3049,7 +3171,7 @@ class App:
         self.switch_row(box, "report_skip_empty", "Skip quiet periods",
                         "Don't send a report when the laser wasn't used")
 
-        ctk.CTkLabel(box, text="Send reports to", font=self.font(13), text_color=TEXT,
+        PlainLabel(box, text="Send reports to", font=self.font(13), text_color=TEXT,
                      anchor="w").pack(fill="x", padx=14, pady=(8, 2))
         for key, label in (("report_tg", "Telegram"), ("report_pc", "Windows notifications"),
                            ("report_other", "Discord, Pushover and email (if set up)")):
@@ -3062,7 +3184,7 @@ class App:
                       fg_color="transparent", border_width=1, border_color=CARD_BORDER,
                       hover_color=CARD_BORDER, text_color=ACCENT, font=self.font(12, "bold"),
                       command=self.send_report_now).pack(anchor="w", padx=14, pady=(8, 0))
-        self.report_status = ctk.CTkLabel(box, text="Sends the last 24 hours, so you can see "
+        self.report_status = PlainLabel(box, text="Sends the last 24 hours, so you can see "
                                                     "what reports look like.",
                                           font=self.font(11), text_color=MUTED, anchor="w",
                                           justify="left", wraplength=300)
@@ -3085,7 +3207,7 @@ class App:
                       fg_color="transparent", hover_color=CARD_BORDER, text_color=MUTED,
                       font=self.font(14), command=self.refresh_ports).pack(side="right", padx=4)
         self.refresh_ports()
-        self.port_status = ctk.CTkLabel(box, text="", font=self.font(11), text_color=MUTED,
+        self.port_status = PlainLabel(box, text="", font=self.font(11), text_color=MUTED,
                                         anchor="w")
         self.port_status.pack(fill="x", padx=14, pady=(0, 10))
 
@@ -3127,7 +3249,7 @@ class App:
         ctk.CTkSwitch(r, text="", variable=self.test_var, onvalue=True, offvalue=False,
                       width=46, command=lambda: self.set_test(self.test_var.get())
                       ).pack(side="right")
-        grid = ctk.CTkFrame(box, fg_color="transparent")
+        grid = PlainFrame(box)
         grid.pack(fill="x", padx=11, pady=(0, 4))
         self.test_buttons = {}
         for i, st in enumerate(["ready", "busy", "paused", "framing", "disconnected", None]):
@@ -3174,29 +3296,29 @@ class App:
                        "until you export it. If the status is ever wrong, right-click the pill "
                        "or tray icon › Status is wrong…", pady=(0, 6))
         self.check_summary = self.note(box, "", pady=(0, 6))
-        r = ctk.CTkFrame(box, fg_color="transparent")
+        r = PlainFrame(box)
         r.pack(fill="x", padx=14, pady=(2, 0))
         self.check_report_btn = self.action_button(r, "Status is wrong…",
                                                    self.report_wrong_from_settings, 130)
         self.check_report_btn.pack(side="left")
         self.action_button(r, "Export…", self.export_check, 80).pack(side="left", padx=6)
-        r = ctk.CTkFrame(box, fg_color="transparent")
+        r = PlainFrame(box)
         r.pack(fill="x", padx=14, pady=(6, 0))
         self.action_button(r, "Open folder", self.open_check_folder, 100).pack(side="left")
         self.action_button(r, "Start again", self.reset_check, 100).pack(side="left", padx=6)
         self.check_status = self.note(box, "", pady=(4, 10))
         self.update_check_summary()
 
-        # Under the category list: Reset order, and the version / OCR engine /
+        # At the end of the page: Reset order, and the version / OCR engine /
         # settings folder for support questions.
-        foot = self.settings_footer = ctk.CTkFrame(lbody, fg_color="transparent")
-        foot.pack(pady=(14, 4))
+        foot = self.settings_footer = PlainFrame(body)
+        foot.pack(pady=(22, 6))
         ctk.CTkButton(foot, text="Reset order", width=140, height=24, corner_radius=8,
                       fg_color="transparent", hover_color=CARD_BORDER, text_color=MUTED,
                       font=self.font(11), command=self.reset_settings_order).pack()
-        ctk.CTkLabel(foot, text=f"{APP_NAME} {APP_VERSION}  \u00b7  reading with {self.ocr_name}"
-                                f"\nsettings in %APPDATA%\\{SETTINGS_FOLDER}", font=self.font(10),
-                     text_color=MUTED).pack(pady=(6, 0))
+        PlainLabel(foot, text=f"{APP_NAME} {APP_VERSION}  \u00b7  reading with {self.ocr_name}"
+                              f"\nsettings in %APPDATA%\\{SETTINGS_FOLDER}", font=self.font(10),
+                   text_color=MUTED, anchor="center", justify="center").pack(pady=(6, 0))
         self.apply_settings_order()
 
     def build_relays_page(self):
@@ -3609,15 +3731,60 @@ class App:
                  ("status", "settings", "relays", "stats", "wizard", "help")
                  if hasattr(self, f"{k}_page")}
         pages.update(self.subpages)
+        settings = pages.pop("settings", None)      # parked, not packed: see park_settings
         for page in pages.values():
             page.pack_forget()
         if (name == "stats") != (prev == "stats"):
             self.resize_for_stats(name == "stats")
-        pages[name].pack(fill="both", expand=True)
+        if name == "settings":
+            self.park_settings()
+            settings.lift()
+        else:
+            pages[name].pack(fill="both", expand=True)
+            if settings is not None:
+                settings.lower()
         if name == "stats":
             self.stats.refresh(force=True)
         elif prev == "stats":
             self.stats.stop()
+
+    def park_settings(self):
+        """Settings stays laid out under the other pages instead of being
+        unpacked: showing it is then just a raise (~55 ms) instead of mapping
+        its ~600 windows again (~0.5 s). Its size is fixed, so dragging the
+        window's edge on other pages doesn't lay the long page out at every
+        step; it's brought to the window's size here, when it's shown."""
+        w, h = self.root.winfo_width(), self.root.winfo_height()
+        page = self.settings_page
+        if page.winfo_manager() != "place":
+            page.place(x=0, y=0, width=w, height=h)
+            if self.page != "settings":
+                page.lower()
+        elif (page.winfo_width(), page.winfo_height()) != (w, h):
+            page.place_configure(width=w, height=h)
+
+    def _prebuild_settings(self):
+        """Build Settings in the background after start-up, then park it (a
+        separate step, so the window stays responsive in between). Started as
+        the pill, the window isn't shown yet: it's parked when first opened."""
+        self.ensure_page("settings")
+        self.root.after(300, lambda: self.root.winfo_viewable() and self.park_settings())
+
+    def _root_resized(self, event):
+        """The window was resized while Settings shows: resize the page once
+        the dragging pauses. Laying the long page out at every step of a
+        drag took ~0.5 s each; meanwhile the page just keeps its size (the
+        strip it leaves is the same colour as the page)."""
+        if event.widget is self.root and self.page == "settings":
+            if getattr(self, "_resize_job", None):
+                self.root.after_cancel(self._resize_job)
+            self._resize_job = self.root.after(150, self._resize_settings)
+
+    def _resize_settings(self):
+        """The resize paused: fit the page to the window."""
+        self._resize_job = None
+        if self.page == "settings":
+            self.park_settings()
 
     def choose_chime(self):
         """Let the user pick a sound file for the job-finished chime. The file
