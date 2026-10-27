@@ -227,7 +227,9 @@ from beacon.detectlog import DetectionLog
 # beacon/updater.py and installer/update-example.json). Empty = off.
 UPDATE_URL = ""
 SUPPORT_EMAIL = ""      # shown in Help when set, e.g. "support@yourshop.com"
-TIP_URL = ""            # tip page (Ko-fi, PayPal.me, GitHub Sponsors...); the setup's last page
+TIP_URL = "https://paypal.me/SevaKorolev"   # tip page (Ko-fi, PayPal.me, GitHub Sponsors...); the setup's last page
+TIP_LABEL = "PayPal  @SevaKorolev"          # what the tip button says under the ♥
+ETRANSFER_EMAIL = "beacon.lasertools@protonmail.com"   # Interac e-Transfer tips (Canada); "" = hidden
                         # shows a "Tip $5" button when set
 # Questions and answers shown on the Help page, in this order. Plain text; the
 # page wraps them itself.
@@ -5817,30 +5819,51 @@ class App:
         self.wiz_live = None
         self.wiz_steps[self.wiz_step]()
         last = self.wiz_step == len(self.wiz_steps) - 1
+        if DEV:                                 # dev: a read-only preview of the pages
+            if not last:                        # the thank-you page has no controls to explain
+                self._wiz_text("Dev mode: a preview. The buttons and switches on these pages "
+                               "are turned off.", color=MUTED, size=11, pady=(10, 4))
+            self._wiz_disable(self.wiz_body)
         self.wiz_next.configure(text="Finish" if last else "Next")
         self.wiz_back.configure(state="normal" if self.wiz_step else "disabled")
         self.wiz_dots.configure(text=f"{self.wiz_step + 1} of {len(self.wiz_steps)}")
         self.wiz_body._parent_canvas.yview_moveto(0)
 
     # -- building blocks
-    def _wiz_text(self, text, color=MUTED, size=12, bold=False, pady=(2, 6)):
+    def _wiz_disable(self, parent):
+        """Grey out every control on a setup page (dev mode), so the pages can be
+        read and their layout checked without changing settings, running a
+        test job or opening links. Back / Next stay outside wiz_body; a control
+        marked wiz_keep (the tip and e-Transfer Copy buttons) stays on."""
+        for w in parent.winfo_children():
+            if getattr(w, "wiz_keep", False):
+                continue
+            if isinstance(w, (ctk.CTkButton, ctk.CTkSwitch, ctk.CTkCheckBox,
+                              ctk.CTkSegmentedButton, ctk.CTkComboBox, ctk.CTkEntry)):
+                w.configure(state="disabled")
+            else:
+                self._wiz_disable(w)
+
+    def _wiz_text(self, text, color=TEXT, size=12, bold=False, pady=(2, 6)):
         """A wrapped paragraph in the setup assistant."""
         ctk.CTkLabel(self.wiz_body, text=text, font=self.font(size, "bold" if bold else "normal"),
                      text_color=color, anchor="w", justify="left",
                      wraplength=310).pack(fill="x", padx=8, pady=pady)
 
-    def _wiz_card(self):
-        """A card to hold controls in the setup assistant."""
+    def _wiz_card(self, top=4):
+        """A card to hold controls in the setup assistant; top = space above it."""
         box = ctk.CTkFrame(self.wiz_body, fg_color=CARD, corner_radius=14, border_width=1,
                            border_color=CARD_BORDER)
-        box.pack(fill="x", padx=4, pady=(4, 6))
+        box.pack(fill="x", padx=4, pady=(top, 6))
         return box
 
     def _wiz_live_label(self):
         """A bold live status line (e.g. "Beacon can see LightBurn: Ready")."""
+        packed = self.wiz_body.pack_slaves()
+        self.wiz_live_after = packed[-1] if packed else None    # where to re-show it
         self.wiz_live = ctk.CTkLabel(self.wiz_body, text="", font=self.font(12, "bold"),
                                      text_color=TEXT, anchor="w", justify="left", wraplength=310)
-        self.wiz_live.pack(fill="x", padx=8, pady=(4, 6))
+        self.wiz_live.pack(fill="x", padx=8, pady=(12, 8))
         self.update_wizard_live()
 
     # -- the steps
@@ -5850,15 +5873,14 @@ class App:
         self._wiz_text(f"{APP_NAME} shows what your laser is doing (Running, Paused, Framing, "
                        "Ready) on your screen, on a stack light and on your phone.",
                        color=TEXT, size=13)
-        self._wiz_text("What it does, most important first:", pady=(8, 2))
         for line in ("Reads LightBurn's status: from the screen, LightBurn's API, or both",
                      "Drives a red / green stack light and buzzer on an Arduino",
                      "Relay buttons for a fan, air assist, exhaust and more",
                      "Messages on Telegram, Windows pop-ups and more",
                      "Run-time reports, job statistics, costs and quotes"):
             self._wiz_text("•  " + line, color=TEXT, pady=(1, 1))
-        self._wiz_text("About 3 minutes. You can skip any step and change everything later "
-                       "in Settings.", pady=(10, 4))
+        self._wiz_text("The next pages show each feature and where to set it up in "
+                       "Settings.", pady=(10, 4))
 
     def _wiz_lightburn(self):
         """Step 1: how LightBurn is read, with the mode switch and a live check
@@ -5879,11 +5901,11 @@ class App:
                                      command=self._wiz_set_mode, font=self.font(12))
         seg.set(self.DETECT_MODES[self.s["detect_mode"]])
         seg.pack(fill="x", padx=8, pady=(8, 4))
-        self._wiz_text("API and Both: LightBurn shows a pop-up the first time: click Allow.",
-                       size=11, pady=(0, 2))
+        self._wiz_text("The mode is chosen in Settings › Detection. With API or Both, LightBurn "
+                       "asks once whether to allow Beacon.", size=11, pady=(0, 2))
         self._wiz_live_label()
         self.action_button(self.wiz_body, "Look again", self.find_lightburn_again, 110).pack(
-            anchor="w", padx=8, pady=(0, 6))
+            anchor="w", padx=8, pady=(2, 8))
 
     def _wiz_set_mode(self, label):
         """The mode switch in the assistant: same as Settings › Detection."""
@@ -5895,14 +5917,15 @@ class App:
         """Step 2: Arduino stack light wiring, upload and COM port."""
         self.wiz_title.configure(text="2  ·  Stack light")
         self._wiz_text("Optional. An Arduino Uno switches a red / green stack light (red = "
-                       "running, green = ready) and beeps when a job ends. No light? Press Next.")
-        for line in ("1.  Wire it as in Help › Wiring: red on D10, green on D9, buzzer on D8.",
-                     "2.  Upload the Beacon sketch with the Arduino IDE. It's in Beacon's "
-                     "install folder › Arduino › laser_stack_light.",
-                     "3.  Plug it in by USB, switch it on below and pick its COM port (or "
-                     "leave Auto-detect)."):
-            self._wiz_text(line, color=TEXT, pady=(1, 3))
-        box = self._wiz_card()
+                       "running, green = ready) and beeps when a job ends.")
+        for line in ("Wiring: red on D10, green on D9, buzzer on D8 (diagram in Help › "
+                     "Wiring).",
+                     "Sketch: laser_stack_light, in Beacon's install folder › Arduino, uploaded "
+                     "with the Arduino IDE.",
+                     "Connection: USB. Beacon finds the COM port itself, or it can be picked "
+                     "in Settings › Arduino light."):
+            self._wiz_text("•  " + line, color=TEXT, pady=(1, 3))
+        box = self._wiz_card(top=12)
         self.switch_row(box, "arduino", "Send status to Arduino", None,
                         on_change=lambda: setattr(self.arduino, "enabled", self.s["arduino"]))
         r = self.row(box, "COM port")
@@ -5934,8 +5957,7 @@ class App:
                        "the main screen.")
         self.action_button(self.wiz_body, "Set up relay buttons  ›",
                            self._wiz_open_relays, 180).pack(anchor="w", padx=8, pady=(8, 4))
-        self._wiz_text("Optional: skip it now and add them later in Settings › Relay "
-                       "buttons.", size=11)
+        self._wiz_text("Optional. Buttons are added in Settings › Relay buttons.", size=11)
 
     def _wiz_open_relays(self):
         """Open Relay buttons from the assistant; Back returns to it."""
@@ -5950,13 +5972,13 @@ class App:
         """Step 4: Telegram bot token, Chat ID (Find), test and commands. Uses
         the same text variables as Settings, so both show the same values."""
         self.wiz_title.configure(text="4  ·  Telegram bot")
-        self._wiz_text("Get a message on your phone when a job finishes, pauses or the laser "
-                       "disconnects, and ask Beacon for /status from anywhere. Optional.")
-        self._wiz_text("1.  In Telegram, message @BotFather, send /newbot and copy the token.",
-                       color=TEXT, pady=(1, 3))
-        self._wiz_text("2.  Paste it below, send your new bot any message, then press Find.",
-                       color=TEXT, pady=(1, 3))
-        box = self._wiz_card()
+        self._wiz_text("Optional. A message on your phone when a job finishes, pauses or the "
+                       "laser disconnects, and /status from anywhere.")
+        self._wiz_text("•  The bot comes from @BotFather in Telegram (/newbot), which gives "
+                       "its token.", color=TEXT, pady=(1, 3))
+        self._wiz_text("•  The token goes in Settings › Telegram bot. After one message to the "
+                       "bot, Find fills in the Chat ID.", color=TEXT, pady=(1, 3))
+        box = self._wiz_card(top=12)
         ctk.CTkLabel(box, text="Bot token", font=self.font(11), text_color=MUTED,
                      anchor="w").pack(fill="x", padx=14, pady=(8, 0))
         ctk.CTkEntry(box, textvariable=self.tg_token_var, show="•", height=30,
@@ -5979,8 +6001,8 @@ class App:
         """Step 5: Windows pop-ups, the main events, quiet hours, and how Beacon
         avoids nagging."""
         self.wiz_title.configure(text="5  ·  Notifications")
-        self._wiz_text("Pick what you want to hear about. Windows pop-ups and Telegram both "
-                       "follow these.")
+        self._wiz_text("Each event can be switched on or off in Settings › Notifications. "
+                       "Windows pop-ups and Telegram both follow these choices.")
         box = self._wiz_card()
         self.switch_row(box, "notify_pc", "Windows pop-ups", None,
                         on_change=self._pc_notify_changed)
@@ -6000,7 +6022,8 @@ class App:
         """Step 6: daily / weekly reports and what Statistics offers."""
         self.wiz_title.configure(text="6  ·  Reports & quotes")
         self._wiz_text("Beacon counts only real running time (pauses left out) and can send "
-                       "you a report by Telegram or Windows pop-up:")
+                       "a report by Telegram or Windows pop-up, switched on in Settings › "
+                       "Usage reports:")
         box = self._wiz_card()
         for kind, label, sub in (("daily", "Daily report", "The last 24 hours, each day"),
                                  ("weekly", "Weekly report", "The last 7 days, day by day")):
@@ -6017,29 +6040,49 @@ class App:
     def _wiz_test(self):
         """Step 7: test mode and a 10 s test job."""
         self.wiz_title.configure(text="7  ·  Test mode")
-        self._wiz_text("Try it all without the laser: test mode fakes LightBurn's status, so "
-                       "you can watch the light, relays and notifications work. Test jobs "
-                       "never count in your statistics.")
+        self._wiz_text("Test mode fakes LightBurn's status, so the light, relays and "
+                       "notifications can be tried without the laser. A test job runs for "
+                       "10 seconds. Test jobs never count in the statistics.")
         self.action_button(self.wiz_body, "Run a 10 s test job", self.toggle_demo_job,
                            170).pack(anchor="w", padx=8, pady=(8, 4))
-        self._wiz_text("More test buttons (Paused, Framing, Disconnected…) are in "
-                       "Settings › Test mode. Finish turns test mode off.", size=11)
+        self._wiz_text("Test mode and its buttons (Paused, Framing, Disconnected…) are in "
+                       "Settings › Test mode.", size=11)
 
     def _wiz_support(self):
-        """Last page: thanks, and a tip button when TIP_URL is set."""
+        """Last page: thanks, a tip button when TIP_URL is set and the e-Transfer
+        address (with Copy) when ETRANSFER_EMAIL is set."""
         self.wiz_title.configure(text="Thank you!")
         self._wiz_text(f"{APP_NAME} is free and its source code is public, so anyone can use "
                        "it and help improve it.", color=TEXT, size=13)
-        self._wiz_text("If it saves you time or material, please support the developer with "
-                       "a $5 tip (or any amount). It helps keep development going.",
+        self._wiz_text("If you enjoy the app and it helps with your work, please support the "
+                       "developer with a $5 tip (or any amount). It helps keep development "
+                       "going.",
                        pady=(6, 8))
         if TIP_URL:
-            ctk.CTkButton(self.wiz_body, text="♥  Tip $5", width=160, height=34,
-                          corner_radius=10, font=self.font(13, "bold"),
-                          command=lambda: webbrowser.open(TIP_URL)).pack(anchor="w", padx=8,
-                                                                         pady=(2, 6))
-        self._wiz_text("Press Finish to start using Beacon. You can run this setup again from "
-                       "Settings › Help & updates.", size=11, pady=(6, 4))
+            tip = ctk.CTkButton(self.wiz_body, text=f"♥  {TIP_LABEL}", width=220, height=34,
+                                corner_radius=10, font=self.font(13, "bold"),
+                                command=lambda: webbrowser.open(TIP_URL))
+            tip.pack(anchor="w", padx=8, pady=(2, 6))
+            tip.wiz_keep = True                 # works in the dev preview too
+        if ETRANSFER_EMAIL:
+            self._wiz_text("Interac e-Transfer (Canada)", bold=True, pady=(8, 0))
+            row = ctk.CTkFrame(self.wiz_body, fg_color="transparent")
+            row.pack(fill="x", padx=8, pady=(0, 6))
+            ctk.CTkLabel(row, text=ETRANSFER_EMAIL, font=self.font(12), text_color=TEXT,
+                         anchor="w").pack(side="left")
+            copied = ctk.CTkLabel(row, text="", font=self.font(11), text_color=MUTED)
+
+            def copy():
+                """Copy the e-Transfer address to the clipboard."""
+                self.root.clipboard_clear()
+                self.root.clipboard_append(ETRANSFER_EMAIL)
+                copied.configure(text="Copied")
+            copy_btn = self.action_button(row, "Copy", copy, 60)
+            copy_btn.pack(side="left", padx=8)
+            copy_btn.wiz_keep = True            # works in the dev preview too
+            copied.pack(side="left")
+        self._wiz_text("These pages can be opened again from Settings › Help & updates.",
+                       size=11, pady=(6, 4))
 
     def update_wizard_live(self):
         """The live line on a setup page (called every tick while it's shown)."""
@@ -6054,7 +6097,7 @@ class App:
                 text = "✅  Beacon can see LightBurn: " + look(self.state)[1]
             if self.s["detect_mode"] != "ocr" and hasattr(self, "api_status"):
                 api = self.api_status.cget("text")
-                if api:
+                if api and api.strip() not in text:     # skip it when it repeats the line above
                     text += "\n" + api
         elif step == self._wiz_stacklight:
             text = ("Arduino: " + self.arduino.status) if self.s["arduino"] else ""
@@ -6065,6 +6108,14 @@ class App:
             text = ""
         if self.wiz_live.cget("text") != text:
             self.wiz_live.configure(text=text, text_color=color)
+        # An empty line would leave a gap: hide it, and put it back in place when
+        # there is something to show.
+        shown = self.wiz_live.winfo_manager() == "pack"
+        if not text and shown:
+            self.wiz_live.pack_forget()
+        elif text and not shown:
+            where = {"after": self.wiz_live_after} if self.wiz_live_after else {}
+            self.wiz_live.pack(fill="x", padx=8, pady=(12, 8), **where)
 
     # ============================================================ help page
     def build_help_page(self):
