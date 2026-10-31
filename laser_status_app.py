@@ -965,6 +965,47 @@ def lightburn_file_name(windows):
     return ""
 
 
+API_MIN_VERSION = "2.2"     # LightBurn's REST API arrived in 2.2
+
+
+def lightburn_version():
+    """The running LightBurn's version, e.g. "2.0.05", or "" if unknown. Read
+    from its title bar ("... - LightBurn Pro 2.0.05"); on macOS, from the
+    app's Info.plist when the title can't be read (no Screen Recording
+    permission)."""
+    try:
+        for h in find_lightburn_windows(include_minimized=True):
+            m = re.search(r"LightBurn(?: Pro| Core)?\s+v?(\d+\.\d+(?:\.\d+)?)", window_title(h))
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+    if IS_MAC:
+        import plistlib
+        for p in psutil.process_iter(["name", "exe"]):
+            exe = p.info.get("exe") or ""
+            if "lightburn" in (p.info.get("name") or "").lower() and ".app/" in exe:
+                try:
+                    with open(exe.split(".app/")[0] + ".app/Contents/Info.plist", "rb") as f:
+                        return str(plistlib.load(f).get("CFBundleShortVersionString", ""))
+                except (OSError, ValueError):
+                    pass
+    return ""
+
+
+def api_unreachable_note():
+    """Why LightBurn's API doesn't answer, as specifically as can be told."""
+    if not lightburn_running():
+        return "LightBurn isn't open. Open LightBurn 2.2 or newer and try again."
+    v = lightburn_version()
+    if v and updater.version_key(v) < updater.version_key(API_MIN_VERSION):
+        return (f"The LightBurn that's open is version {v}. Its API needs LightBurn "
+                f"{API_MIN_VERSION} or newer: update LightBurn, or set Settings › Detection "
+                f"to Screen.")
+    return ("LightBurn's API isn't answering. Check that LightBurn 2.2 or newer is open, "
+            "then try again.")
+
+
 class Detector(threading.Thread):
     """Once the status readout has been found, only that small area is read
     each time (fast, light on CPU). If it disappears, the whole window is
@@ -1325,7 +1366,7 @@ class ApiDetector(Detector):
                 return None, str(e), [], "api-error"
             if not lightburn_running():
                 return None, "LightBurn isn't open", [], "none"
-            return None, str(e), [], "api-error"
+            return None, api_unreachable_note() if e.code == 0 else str(e), [], "api-error"
         job = snap.get("job") or {}
         conn = snap.get("connection") or {}
         state, connected = job.get("state"), conn.get("connected")
@@ -4459,8 +4500,7 @@ class App:
         def work():
             try:
                 if not lbapi.available():
-                    raise lbapi.ApiError("LightBurn's API isn't answering. Open LightBurn 2.2 "
-                                         "or newer and try again.")
+                    raise lbapi.ApiError(api_unreachable_note())
                 secret = lbapi.pair(APP_NAME)
             except lbapi.ApiError as e:
                 self._on_ui(lambda m=str(e): self._paired(None, m))
