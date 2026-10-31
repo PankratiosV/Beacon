@@ -80,7 +80,12 @@ const int FIRE_ACTIVE = LOW;
 // HIGH for ULN2003 / MOSFET / transistor / most SSRs.
 // LOW for the common blue relay boards that switch on with a LOW input.
 // (With mechanical relays, turn "Blink" off in the app to save the relays.)
-const int OUTPUT_ON = LOW;
+// Beacon's "Install on Arduino" button builds this both ways (BEACON_OUTPUT_ON);
+// in the Arduino IDE, change LOW here.
+#ifndef BEACON_OUTPUT_ON
+#define BEACON_OUTPUT_ON LOW
+#endif
+const int OUTPUT_ON = BEACON_OUTPUT_ON;
 
 // Extra relays (fan, air assist, ...) switched from the app. Same on-level
 // as the stack light relays.
@@ -89,7 +94,11 @@ const int RELAY_COUNT = sizeof(RELAY_PINS) / sizeof(RELAY_PINS[0]);
 
 // true  = passive buzzer (needs a tone; most small piezo discs)
 // false = active buzzer (beeps by itself when powered)
-const bool PASSIVE_BUZZER = true;
+// (BEACON_PASSIVE_BUZZER: set by Beacon's "Install on Arduino" button.)
+#ifndef BEACON_PASSIVE_BUZZER
+#define BEACON_PASSIVE_BUZZER true
+#endif
+const bool PASSIVE_BUZZER = BEACON_PASSIVE_BUZZER;
 const unsigned int BUZZ_HZ = 2700;
 
 // TIMEOUT_MS: silence from the app this long switches lights and relays off.

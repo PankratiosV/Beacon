@@ -28,7 +28,8 @@ if not exist "%PY%" (
 rem PyInstaller turns the script into dist\Beacon\Beacon.exe plus its _internal
 rem folder (Python and every package inside, so customers need nothing else):
 rem   --windowed            no console window
-rem   --add-data            ship the icon next to the code (found via sys._MEIPASS)
+rem   --add-data            ship the icon and the Arduino firmware (Install on
+rem                         Arduino) next to the code (found via sys._MEIPASS)
 rem   --collect-all winrt   the Windows OCR bindings load parts PyInstaller can't see
 rem   --collect-data customtkinter   its themes and fonts
 echo [1/2] Bundling the app...
@@ -36,6 +37,7 @@ echo [1/2] Bundling the app...
     --name "Beacon" ^
     --icon "%CD%\laser_status.ico" ^
     --add-data "%CD%\laser_status.ico;." ^
+    --add-data "%CD%\firmware;firmware" ^
     --collect-all winrt ^
     --collect-data customtkinter ^
     --specpath build ^

@@ -263,6 +263,7 @@ except ImportError:
 # - camera: webcam snapshot attached to alerts
 # - channels: Discord, Pushover, email and SMS senders
 # - exporters: CSV / Excel / PDF reports
+# - flasher: uploads the stack light sketch to an Arduino Uno (Install on Arduino)
 # - smartplugs: Shelly / Tasmota / Home Assistant switches used as relays
 # - updater: checks UPDATE_URL for a newer version
 # - webdash: the phone dashboard (a tiny web server on your Wi-Fi)
@@ -275,7 +276,7 @@ import platform
 import subprocess
 import webbrowser
 import zipfile
-from beacon import camera, channels, exporters, smartplugs, updater, webdash
+from beacon import camera, channels, exporters, flasher, smartplugs, updater, webdash
 from beacon import lbapi
 if IS_WIN:
     from beacon import winsys as osys
@@ -304,10 +305,11 @@ HELP_FAQ = [
      "display scaling the same as when it worked. Settings › Check every 1 s is steadier."),
     ("The Arduino isn't found.",
      "Close the Arduino IDE's Serial Monitor (only one program can use the port), unplug and "
-     "replug the USB cable, and check the Beacon sketch is uploaded."),
+     "replug the USB cable, and put Beacon's program on it: Settings › Arduino light › "
+     "Install on Arduino."),
     ("The light stays on when the PC is off.",
      "The sketch switches everything off a few seconds after messages stop. If it doesn't, "
-     "re-upload the latest sketch."),
+     "press Settings › Arduino light › Install on Arduino to put the latest program on it."),
     ("Telegram messages don't arrive.",
      "Send your bot any message first, then press Find to fill in the Chat ID, and Send test."),
     ("My phone can't open the dashboard.",
@@ -326,6 +328,17 @@ APP_ID = "LaserStatusV2.Dev" if DEV else "LaserStatusV2.App"
 # Bundled as an .exe (PyInstaller), files like the icon are unpacked to sys._MEIPASS
 BASE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
 ICON_PATH = os.path.join(BASE_DIR, "laser_status.ico")
+# The ready-compiled Uno sketch that "Install on Arduino" uploads (made by
+# installer/build_firmware.sh), one file per hardware choice
+FIRMWARE_DIR = os.path.join(BASE_DIR, "firmware")
+# The Arduino sketches as source, for the Arduino IDE: the Windows installer
+# puts them in <install folder>\Arduino, the Mac app carries them inside, and
+# running from source they're next to this file.
+if getattr(sys, "frozen", False):
+    SKETCH_DIR = (os.path.join(os.path.dirname(sys.executable), "Arduino") if IS_WIN
+                  else os.path.join(BASE_DIR, "Arduino"))
+else:
+    SKETCH_DIR = os.path.dirname(os.path.abspath(__file__))
 if IS_WIN:
     try:
         # Tell Windows this process is "Beacon", not "Python", so the taskbar
@@ -417,10 +430,13 @@ DEFAULTS = {
     "interval": 1.0,         # seconds between checks
     "arduino": False,
     "port": "Auto-detect",
+    "fw_outputs": "low",     # Install on Arduino: outputs on with LOW (relay boards) / HIGH
+    "fw_buzzer": "passive",  # Install on Arduino: passive / active buzzer
     "compact": False,
     "compact_pos": None,
     "diagnostics": False,
     "relays": None,          # filled in by load_settings()
+    "relays_home": True,     # relay buttons (or "+ Add relay buttons") on the main screen
     "costs": None,           # filled in by load_settings()
     # --- alerts
     "alert_long_run_min": 0,     # a job running longer than this (0 = off)
@@ -1613,6 +1629,8 @@ class ArduinoLink(LinkBase):
         self._ser = None
         self._open_port = None
         self._buf = b""
+        self.hold = False           # Install on Arduino is using the port: stay off it
+        self._opened_at = 0.0
 
     def _read_inputs(self):
         """Read whatever the board sent (non-blocking, timeout=0) and keep the
@@ -1656,6 +1674,12 @@ class ArduinoLink(LinkBase):
                 self.status = "pyserial not installed"
                 self.stop_evt.wait(2)
                 continue
+            if self.hold:
+                self._close()
+                self.status = "Installing Beacon's program on the Arduino…"
+                self.wake.wait(0.2)
+                self.wake.clear()
+                continue
             if not self.enabled:
                 self._close(send_off=True)
                 self.status = "Off"
@@ -1676,6 +1700,7 @@ class ArduinoLink(LinkBase):
                     time.sleep(2.0)          # Uno resets when the port opens
                     self._open_port = wanted
                     self.connected = True
+                    self._opened_at = time.time()
                     self.status = f"Connected on {wanted}"
                 except Exception:
                     self._close()
@@ -1688,6 +1713,14 @@ class ArduinoLink(LinkBase):
             except Exception:
                 self._close()
                 self.status = "Arduino unplugged"
+            if self._ser is not None:
+                # Beacon's sketch reports its inputs every 250 ms. A board that
+                # stays silent is new or runs another program.
+                silent = not self.inputs or self.inputs["time"] < self._opened_at
+                self.status = (f"Connected on {self._open_port}, but the Arduino isn't "
+                               "answering. If it's new, press Install on Arduino below."
+                               if silent and time.time() - self._opened_at > 6 else
+                               f"Connected on {self._open_port}")
             self.wake.wait(0.5)
             self.wake.clear()
         self._close(send_off=True)
@@ -2915,7 +2948,7 @@ class App:
         self.relay_panel = ctk.CTkFrame(p, fg_color="transparent")
         self.relay_panel.pack(fill="x", padx=15, pady=(0, 8))
 
-        foot = ctk.CTkFrame(p, fg_color="transparent")
+        foot = self.home_foot = ctk.CTkFrame(p, fg_color="transparent")
         foot.pack(fill="x", padx=22, pady=(0, 14))
         self.check_lbl = ctk.CTkLabel(foot, text="", font=self.font(11), text_color=MUTED)
         self.check_lbl.pack(side="left")
@@ -3241,6 +3274,9 @@ class App:
                       fg_color="transparent", hover_color=CARD_BORDER, text_color=ACCENT,
                       font=self.font(12, "bold"),
                       command=lambda: self.open_relays("settings")).pack(side="right")
+        self.switch_row(box, "relays_home", "Show on the main screen",
+                        "Off hides them there; automatic rules keep working",
+                        on_change=self.rebuild_relay_panel)
 
         # --- Telegram bot
         box = self.section(body, "Telegram bot", "telegram")
@@ -3406,6 +3442,21 @@ class App:
         self.port_status = PlainLabel(box, text="", font=self.font(11), text_color=MUTED,
                                         anchor="w")
         self.port_status.pack(fill="x", padx=14, pady=(0, 10))
+        # Install on Arduino: puts Beacon's sketch on a new (or any) Uno, no
+        # Arduino IDE needed. The two choices pick the matching firmware file.
+        self.menu_row(box, "fw_outputs", "Outputs switch on", "Set by your relay board "
+                      "or driver", {"low": "LOW (relay board)", "high": "HIGH (ULN2003)"},
+                      width=150)
+        self.menu_row(box, "fw_buzzer", "Buzzer", None,
+                      {"passive": "Passive (piezo)", "active": "Active"}, width=150)
+        r = self.row(box, "Arduino program", "For a new board, or after changing the "
+                                             "choices above")
+        self.flash_btn = self.action_button(r, "Install on Arduino", self.install_firmware, 165)
+        self.flash_btn.pack(side="right")
+        self.flash_status = self.note(box, "", pady=(0, 4))
+        self.action_button(self.row(box, "Arduino sketches",
+                                    "To change pins or settings in the Arduino IDE"),
+                           "Show", lambda: open_path(SKETCH_DIR), 70).pack(side="right")
 
         # --- Windows
         box = self.section(body, OS_NAME, "windows")
@@ -4588,6 +4639,71 @@ class App:
         self.arduino.port = value
         save_settings(self.s)
 
+    def install_firmware(self):
+        """The "Install on Arduino" button: upload Beacon's stack light sketch
+        (the firmware file matching the two choices above it) to the Uno, with
+        beacon/flasher.py. The Arduino link lets go of the port meanwhile (only
+        one program can use it) and takes it back afterwards. The upload runs
+        on a thread and reports through _on_ui."""
+        if getattr(self, "_flashing", False):
+            return
+        if not HAVE_SERIAL:
+            self.flash_status.configure(text="pyserial isn't installed.", text_color=RED)
+            return
+        hex_path = os.path.join(FIRMWARE_DIR, f"laser_stack_light-{self.s['fw_outputs']}-"
+                                              f"{self.s['fw_buzzer']}.hex")
+        if not os.path.exists(hex_path):
+            self.flash_status.configure(text="The Arduino program is missing from this copy "
+                                             "of Beacon. Reinstall Beacon.", text_color=RED)
+            return
+        port = (self.s["port"] if self.s["port"] != "Auto-detect"
+                else self.arduino._open_port or find_arduino_port())
+        if not port:
+            self.flash_status.configure(text="No Arduino found. Plug it in with a USB cable "
+                                             "(one that carries data), then try again.",
+                                        text_color=RED)
+            return
+        if not messagebox.askyesno(
+                APP_NAME, f"Install Beacon's stack light program on the Arduino on {port}?\n\n"
+                          "This replaces whatever program is on it now. It takes about "
+                          "20 seconds; don't unplug it meanwhile.", parent=self.root):
+            return
+        self._flashing = True
+        self.flash_btn.configure(state="disabled")
+        self.flash_status.configure(text="Starting…", text_color=AMBER)
+
+        def progress(fraction, text):
+            self._on_ui(lambda: self.flash_status.configure(
+                text=f"{text} {fraction:.0%}" if 0 < fraction < 1 else text, text_color=AMBER))
+
+        def work():
+            link = self.arduino
+            link.hold = True                    # the link closes the port...
+            link.wake.set()
+            end = time.time() + 5
+            while link._ser is not None and time.time() < end:
+                time.sleep(0.1)                 # ...within half a second
+            try:
+                size = flasher.upload(port, hex_path, progress)
+                result = (f"✓ Installed on {port} ({size // 1024} KB). Turn on Send status "
+                          "to Arduino above if it's off.", MUTED)
+            except flasher.FlashError as e:
+                result = (str(e), RED)
+            except Exception as e:              # never leave the button stuck
+                logging.exception("Install on Arduino")
+                result = (f"The upload failed: {e}", RED)
+            finally:
+                link.hold = False
+                link.wake.set()
+            self._on_ui(lambda: self._firmware_done(*result))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _firmware_done(self, text, color):
+        """Install on Arduino finished (on the UI thread)."""
+        self._flashing = False
+        self.flash_btn.configure(state="normal")
+        self.flash_status.configure(text=text, text_color=color)
+
     # ---------------------------------------------------------- test mode
     def set_test(self, on):
         """Switch test mode on or off. On: the detector's messages are ignored
@@ -4648,30 +4764,38 @@ class App:
     def rebuild_relay_panel(self):
         """Rebuild the relay buttons on the Home page (two per row), or an "Add
         relay buttons" link when there are none, and make the window tall
-        enough for them."""
+        enough for them. With "Show on the main screen" off, the area is
+        taken out of the page (an empty frame would still take up room);
+        the relays keep following their automatic rules."""
         for w in self.relay_panel.winfo_children():
             w.destroy()
         self.relay_buttons, self._relay_keys = {}, {}
         used = [i for i, r in enumerate(self.s["relays"]) if r["use"]]
-        if not used:
-            ctk.CTkButton(self.relay_panel, text="+  Add relay buttons", height=30,
-                          corner_radius=10, fg_color="transparent", hover_color=CARD_BORDER,
-                          text_color=MUTED, font=self.font(12),
-                          command=lambda: self.open_relays("status")).pack(fill="x")
-            extra = 38
+        if not self.s["relays_home"]:
+            self.relay_panel.pack_forget()
+            extra = 0
         else:
-            cols = 2
-            for n, i in enumerate(used):
-                b = ctk.CTkButton(self.relay_panel, height=46, corner_radius=12, border_width=1,
-                                  font=self.font(12, "bold"),
-                                  command=lambda i=i: self.toggle_relay(i))
-                b.grid(row=n // cols, column=n % cols, padx=3, pady=3, sticky="ew")
-                for button in RIGHT_CLICK:
-                    b.bind(button, lambda e, i=i: self.rename_relay(i))
-                self.relay_buttons[i] = b
-            for col in range(cols):
-                self.relay_panel.grid_columnconfigure(col, weight=1, uniform="relay")
-            extra = ((len(used) + cols - 1) // cols) * 52
+            if not self.relay_panel.winfo_manager():     # was hidden: put it back
+                self.relay_panel.pack(fill="x", padx=15, pady=(0, 8), before=self.home_foot)
+            if not used:
+                ctk.CTkButton(self.relay_panel, text="+  Add relay buttons", height=30,
+                              corner_radius=10, fg_color="transparent", hover_color=CARD_BORDER,
+                              text_color=MUTED, font=self.font(12),
+                              command=lambda: self.open_relays("status")).pack(fill="x")
+                extra = 38
+            else:
+                cols = 2
+                for n, i in enumerate(used):
+                    b = ctk.CTkButton(self.relay_panel, height=46, corner_radius=12, border_width=1,
+                                      font=self.font(12, "bold"),
+                                      command=lambda i=i: self.toggle_relay(i))
+                    b.grid(row=n // cols, column=n % cols, padx=3, pady=3, sticky="ew")
+                    for button in RIGHT_CLICK:
+                        b.bind(button, lambda e, i=i: self.relay_menu(e, i))
+                    self.relay_buttons[i] = b
+                for col in range(cols):
+                    self.relay_panel.grid_columnconfigure(col, weight=1, uniform="relay")
+                extra = ((len(used) + cols - 1) // cols) * 52
         self.update_relays()
         # Grow the window so the orb keeps its room
         self._min_h = 500 + extra
@@ -4702,15 +4826,30 @@ class App:
         self.relay_override[i] = not self.relay_on[i]
         self.update_relays()
 
+    def relay_menu(self, e, i):
+        """Right-click a relay button on the Home page: Rename or Remove."""
+        self.popup_menu(e.x_root, e.y_root, [("Rename…", lambda: self.rename_relay(i)),
+                                             ("Remove button", lambda: self.remove_relay(i))])
+
     def rename_relay(self, i):
-        """Right-click a relay button: ask for a new name. Setting the name
-        variable saves it through its trace (see rebuild_relays_page)."""
+        """Ask for a new name for relay i's button. If the Relay buttons page
+        is built, its name box is set (its trace saves it), so both agree;
+        otherwise the name is saved directly."""
         d = ctk.CTkInputDialog(text=f"New name for the pin {RELAY_PINS[i]} button:",
                                title="Rename button")
         d.attributes("-topmost", True)
         name = d.get_input()
         if name and name.strip():
-            self.relay_name_vars[i].set(name.strip()[:24])
+            name = name.strip()[:24]
+            if i in getattr(self, "relay_name_vars", {}):
+                self.relay_name_vars[i].set(name)
+            else:
+                self.set_relay(i, "name", name)
+
+    def remove_relay(self, i):
+        """Remove relay i's button (its relay switches off). Its name and
+        rules are kept, so adding the same pin again brings them back."""
+        self.set_relay(i, "use", False)
 
     @staticmethod
     def schedule_active(r, now_dt):
@@ -6304,8 +6443,8 @@ class App:
                        "running, green = ready) and beeps when a job ends.")
         for line in ("Wiring: red on D10, green on D9, buzzer on D8 (diagram in Help › "
                      "Wiring).",
-                     "Sketch: laser_stack_light, in Beacon's install folder › Arduino, uploaded "
-                     "with the Arduino IDE.",
+                     "Program: plug the Arduino in and press Settings › Arduino light › "
+                     "Install on Arduino (no Arduino IDE needed).",
                      "Connection: USB. Beacon finds the COM port itself, or it can be picked "
                      "in Settings › Arduino light."):
             self._wiz_text("•  " + line, color=TEXT, pady=(1, 3))
@@ -6517,8 +6656,11 @@ class App:
         self.note(box, "Sketch: esp32_stack_light. Red GPIO 25, green 26, buzzer 27, buzzer switch "
                        "14, relays 16 17 18 19 21 22 23 32 33, button 4, fire 13, temperature 34 "
                        "(TMP36 on 3.3 V), lid 35, flow 39 (35 and 39 need a 10 k pull-up to "
-                       "3.3 V). Put your Wi-Fi name and password at the top of the sketch.",
-                  pady=(10, 10))
+                       "3.3 V). Put your Wi-Fi name and password at the top of the sketch "
+                       "and upload it with the Arduino IDE.",
+                  pady=(10, 0))
+        self.action_button(self.row(box, "ESP32 sketch", "esp32_stack_light"),
+                           "Show", lambda: open_path(SKETCH_DIR), 70).pack(side="right")
         box = self.section(body, "Questions")
         for q, a in HELP_FAQ:
             ctk.CTkLabel(box, text=q, font=self.font(12, "bold"), text_color=TEXT, anchor="w",
