@@ -28,6 +28,8 @@ Windows 10/11 (64-bit) and macOS 12.3 or newer. Free for noncommercial use — s
   most accurate times.
 - **Stack light, buzzer and relays** on an Arduino Uno (USB) or an ESP32 (Wi-Fi): red while
   running, green when ready, beeps when a job finishes, relay buttons for a fan or air assist.
+  Beacon puts its program on a new Arduino Uno itself (*Settings › Arduino light › Install on
+  Arduino*), with no Arduino IDE needed. The ESP32 is still set up with the Arduino IDE.
 - **Safety inputs:** fire/smoke (the board alarms on its own, even with the PC off),
   temperature, lid and exhaust/coolant flow sensors.
 - **Notifications:** Windows, Telegram (with commands like `/status`), Discord, Pushover, email
@@ -76,7 +78,11 @@ also run `python3 laser_status_app.py` instead of the second file.
 
 ### Build the installer
 
-Needs [Inno Setup 6](https://jrsoftware.org/isinfo.php) and Python 3.11+. Run
+First, after any change to `laser_stack_light.ino`, run `installer/build_firmware.sh` (on a Mac
+or Linux) and commit the `firmware/` folder it updates. Those are the ready-compiled files that
+*Install on Arduino* uploads. The script downloads Arduino's command-line compiler into `build/`.
+
+Windows needs [Inno Setup 6](https://jrsoftware.org/isinfo.php) and Python 3.11+. Run
 `installer\build_installer.bat`; it bundles the app with PyInstaller (in its own environment,
 with the versions in `installer/build-requirements.txt`) and writes
 `installer/Output/Beacon-Setup-<version>.exe`. Optional code signing is described at the top of

@@ -8,6 +8,7 @@
   winsys      tray icon, global hotkey, start with Windows, firewall, idle time
   macsys      the same for macOS: menu-bar icon, hotkey, open at login
   maccapture  macOS window capture and Vision text recognition
+  flasher     uploads the stack light sketch to an Arduino Uno over USB
   updater     update check, download and silent install
   camera      webcam snapshots (needs opencv-python-headless)
   detectlog   the opt-in detection accuracy log"""

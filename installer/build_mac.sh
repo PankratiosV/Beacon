@@ -71,6 +71,11 @@ if ! lipo -archs "$(ls "$ENV"/lib/python3.*/site-packages/PIL/_imaging.*.so)" | 
     "$PY" -m pip install --force-reinstall --no-deps "$W"/universal2/*.whl
 fi
 
+if ! ls firmware/laser_stack_light-*.hex >/dev/null 2>&1; then
+    echo "firmware/ is empty: run installer/build_firmware.sh first."
+    exit 1
+fi
+
 echo "[1/4] Making the icon..."
 mkdir -p build
 "$PY" - <<'EOF'
@@ -84,7 +89,9 @@ EOF
 echo "[2/4] Bundling the app..."
 # --windowed makes a .app; --target-arch universal2 checks every part runs on
 # both processors; --add-data ships the .ico (the menu-bar icon) next to the
-# code, found via sys._MEIPASS; --collect-data customtkinter: its themes and
+# code, found via sys._MEIPASS, and so does the Arduino firmware Install on
+# Arduino uploads (firmware/) and the sketches and wiring guide (Arduino/);
+# --collect-data customtkinter: its themes and
 # fonts; certifi: the trusted certificates HTTPS needs (see SSL_CERT_FILE in
 # laser_status_app.py).
 "$PY" -m PyInstaller --noconfirm --clean --windowed --target-arch universal2 \
@@ -92,6 +99,10 @@ echo "[2/4] Bundling the app..."
     --icon "$PWD/build/Beacon.icns" \
     --osx-bundle-identifier "$BUNDLE_ID" \
     --add-data "$PWD/laser_status.ico:." \
+    --add-data "$PWD/firmware:firmware" \
+    --add-data "$PWD/laser_stack_light/laser_stack_light.ino:Arduino/laser_stack_light" \
+    --add-data "$PWD/esp32_stack_light/esp32_stack_light.ino:Arduino/esp32_stack_light" \
+    --add-data "$PWD/docs/hardware-kit.md:Arduino" \
     --collect-data customtkinter --collect-data certifi \
     --hidden-import beacon.macsys --hidden-import beacon.maccapture \
     --hidden-import Vision --hidden-import ScreenCaptureKit --hidden-import UserNotifications \
