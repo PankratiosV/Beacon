@@ -436,6 +436,7 @@ DEFAULTS = {
     "compact_pos": None,
     "diagnostics": False,
     "relays": None,          # filled in by load_settings()
+    "relays_home": True,     # relay buttons (or "+ Add relay buttons") on the main screen
     "costs": None,           # filled in by load_settings()
     # --- alerts
     "alert_long_run_min": 0,     # a job running longer than this (0 = off)
@@ -2947,7 +2948,7 @@ class App:
         self.relay_panel = ctk.CTkFrame(p, fg_color="transparent")
         self.relay_panel.pack(fill="x", padx=15, pady=(0, 8))
 
-        foot = ctk.CTkFrame(p, fg_color="transparent")
+        foot = self.home_foot = ctk.CTkFrame(p, fg_color="transparent")
         foot.pack(fill="x", padx=22, pady=(0, 14))
         self.check_lbl = ctk.CTkLabel(foot, text="", font=self.font(11), text_color=MUTED)
         self.check_lbl.pack(side="left")
@@ -3273,6 +3274,9 @@ class App:
                       fg_color="transparent", hover_color=CARD_BORDER, text_color=ACCENT,
                       font=self.font(12, "bold"),
                       command=lambda: self.open_relays("settings")).pack(side="right")
+        self.switch_row(box, "relays_home", "Show on the main screen",
+                        "Off hides them there; automatic rules keep working",
+                        on_change=self.rebuild_relay_panel)
 
         # --- Telegram bot
         box = self.section(body, "Telegram bot", "telegram")
@@ -4760,30 +4764,38 @@ class App:
     def rebuild_relay_panel(self):
         """Rebuild the relay buttons on the Home page (two per row), or an "Add
         relay buttons" link when there are none, and make the window tall
-        enough for them."""
+        enough for them. With "Show on the main screen" off, the area is
+        taken out of the page (an empty frame would still take up room);
+        the relays keep following their automatic rules."""
         for w in self.relay_panel.winfo_children():
             w.destroy()
         self.relay_buttons, self._relay_keys = {}, {}
         used = [i for i, r in enumerate(self.s["relays"]) if r["use"]]
-        if not used:
-            ctk.CTkButton(self.relay_panel, text="+  Add relay buttons", height=30,
-                          corner_radius=10, fg_color="transparent", hover_color=CARD_BORDER,
-                          text_color=MUTED, font=self.font(12),
-                          command=lambda: self.open_relays("status")).pack(fill="x")
-            extra = 38
+        if not self.s["relays_home"]:
+            self.relay_panel.pack_forget()
+            extra = 0
         else:
-            cols = 2
-            for n, i in enumerate(used):
-                b = ctk.CTkButton(self.relay_panel, height=46, corner_radius=12, border_width=1,
-                                  font=self.font(12, "bold"),
-                                  command=lambda i=i: self.toggle_relay(i))
-                b.grid(row=n // cols, column=n % cols, padx=3, pady=3, sticky="ew")
-                for button in RIGHT_CLICK:
-                    b.bind(button, lambda e, i=i: self.rename_relay(i))
-                self.relay_buttons[i] = b
-            for col in range(cols):
-                self.relay_panel.grid_columnconfigure(col, weight=1, uniform="relay")
-            extra = ((len(used) + cols - 1) // cols) * 52
+            if not self.relay_panel.winfo_manager():     # was hidden: put it back
+                self.relay_panel.pack(fill="x", padx=15, pady=(0, 8), before=self.home_foot)
+            if not used:
+                ctk.CTkButton(self.relay_panel, text="+  Add relay buttons", height=30,
+                              corner_radius=10, fg_color="transparent", hover_color=CARD_BORDER,
+                              text_color=MUTED, font=self.font(12),
+                              command=lambda: self.open_relays("status")).pack(fill="x")
+                extra = 38
+            else:
+                cols = 2
+                for n, i in enumerate(used):
+                    b = ctk.CTkButton(self.relay_panel, height=46, corner_radius=12, border_width=1,
+                                      font=self.font(12, "bold"),
+                                      command=lambda i=i: self.toggle_relay(i))
+                    b.grid(row=n // cols, column=n % cols, padx=3, pady=3, sticky="ew")
+                    for button in RIGHT_CLICK:
+                        b.bind(button, lambda e, i=i: self.relay_menu(e, i))
+                    self.relay_buttons[i] = b
+                for col in range(cols):
+                    self.relay_panel.grid_columnconfigure(col, weight=1, uniform="relay")
+                extra = ((len(used) + cols - 1) // cols) * 52
         self.update_relays()
         # Grow the window so the orb keeps its room
         self._min_h = 500 + extra
@@ -4814,15 +4826,30 @@ class App:
         self.relay_override[i] = not self.relay_on[i]
         self.update_relays()
 
+    def relay_menu(self, e, i):
+        """Right-click a relay button on the Home page: Rename or Remove."""
+        self.popup_menu(e.x_root, e.y_root, [("Rename…", lambda: self.rename_relay(i)),
+                                             ("Remove button", lambda: self.remove_relay(i))])
+
     def rename_relay(self, i):
-        """Right-click a relay button: ask for a new name. Setting the name
-        variable saves it through its trace (see rebuild_relays_page)."""
+        """Ask for a new name for relay i's button. If the Relay buttons page
+        is built, its name box is set (its trace saves it), so both agree;
+        otherwise the name is saved directly."""
         d = ctk.CTkInputDialog(text=f"New name for the pin {RELAY_PINS[i]} button:",
                                title="Rename button")
         d.attributes("-topmost", True)
         name = d.get_input()
         if name and name.strip():
-            self.relay_name_vars[i].set(name.strip()[:24])
+            name = name.strip()[:24]
+            if i in getattr(self, "relay_name_vars", {}):
+                self.relay_name_vars[i].set(name)
+            else:
+                self.set_relay(i, "name", name)
+
+    def remove_relay(self, i):
+        """Remove relay i's button (its relay switches off). Its name and
+        rules are kept, so adding the same pin again brings them back."""
+        self.set_relay(i, "use", False)
 
     @staticmethod
     def schedule_active(r, now_dt):
