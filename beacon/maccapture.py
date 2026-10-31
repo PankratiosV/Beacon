@@ -9,6 +9,7 @@ permission (System Settings > Privacy & Security > Screen & System Audio
 Recording); without it titles come back empty and pictures blank, and
 `screen_permission()` says so."""
 
+import ctypes
 import io
 import re
 import threading
@@ -36,30 +37,102 @@ def screen_permission(ask=False):
     return False
 
 
+# --------------------------------------------- the window list, as plain C calls
+# Read with ctypes rather than pyobjc: through pyobjc, every value read from
+# the list (a window's number, owner, size...) left a small wrapper object
+# behind that was never freed, ~10 KB per lookup with ~100 windows open and
+# several lookups a second. Here each list is converted to plain Python and
+# released at once.
+_CF = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+_CG = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+_P = ctypes.c_void_p
+
+
+class _CGRect(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double),
+                ("width", ctypes.c_double), ("height", ctypes.c_double)]
+
+
+for _fn, _res, _args in (
+        (_CG.CGWindowListCopyWindowInfo, _P, [ctypes.c_uint32, ctypes.c_uint32]),
+        (_CG.CGRectMakeWithDictionaryRepresentation, ctypes.c_bool, [_P, ctypes.POINTER(_CGRect)]),
+        (_CF.CFArrayGetCount, ctypes.c_long, [_P]),
+        (_CF.CFArrayGetValueAtIndex, _P, [_P, ctypes.c_long]),
+        (_CF.CFDictionaryGetValue, _P, [_P, _P]),
+        (_CF.CFNumberGetValue, ctypes.c_bool, [_P, ctypes.c_int, _P]),
+        (_CF.CFBooleanGetValue, ctypes.c_bool, [_P]),
+        (_CF.CFStringGetLength, ctypes.c_long, [_P]),
+        (_CF.CFStringGetMaximumSizeForEncoding, ctypes.c_long, [ctypes.c_long, ctypes.c_uint32]),
+        (_CF.CFStringGetCString, ctypes.c_bool, [_P, ctypes.c_char_p, ctypes.c_long,
+                                                 ctypes.c_uint32]),
+        (_CF.CFRelease, None, [_P])):
+    _fn.restype, _fn.argtypes = _res, _args
+
+# The dictionary keys (CFString constants exported by CoreGraphics)
+_KEY = {k: _P.in_dll(_CG, "kCGWindow" + k).value
+        for k in ("Number", "Layer", "Bounds", "OwnerName", "Name", "IsOnscreen")}
+LIST_ALL, LIST_INCLUDING_WINDOW, LIST_EXCLUDE_DESKTOP = 0, 1 << 3, 1 << 4
+CF_SINT64, CF_UTF8 = 4, 0x08000100
+
+
+def _cf_int(ref):
+    out = ctypes.c_int64()
+    return out.value if ref and _CF.CFNumberGetValue(ref, CF_SINT64, ctypes.byref(out)) else 0
+
+
+def _cf_str(ref):
+    if not ref:
+        return ""
+    size = _CF.CFStringGetMaximumSizeForEncoding(_CF.CFStringGetLength(ref), CF_UTF8) + 1
+    buf = ctypes.create_string_buffer(size)
+    ok = _CF.CFStringGetCString(ref, buf, size, CF_UTF8)
+    return buf.value.decode("utf-8", "replace") if ok else ""
+
+
+def _window_list(option, relative_to=0):
+    """Windows as plain dicts: id, layer, owner, name, onscreen, width,
+    height (points), front to back."""
+    arr = _CG.CGWindowListCopyWindowInfo(option, relative_to)
+    if not arr:
+        return []
+    try:
+        out = []
+        for i in range(_CF.CFArrayGetCount(arr)):
+            d = _CF.CFArrayGetValueAtIndex(arr, i)
+            rect = _CGRect()
+            bounds = _CF.CFDictionaryGetValue(d, _KEY["Bounds"])
+            if bounds:
+                _CG.CGRectMakeWithDictionaryRepresentation(bounds, ctypes.byref(rect))
+            onscreen = _CF.CFDictionaryGetValue(d, _KEY["IsOnscreen"])
+            out.append({"id": _cf_int(_CF.CFDictionaryGetValue(d, _KEY["Number"])),
+                        "layer": _cf_int(_CF.CFDictionaryGetValue(d, _KEY["Layer"])),
+                        "owner": _cf_str(_CF.CFDictionaryGetValue(d, _KEY["OwnerName"])),
+                        "name": _cf_str(_CF.CFDictionaryGetValue(d, _KEY["Name"])),
+                        "onscreen": bool(onscreen and _CF.CFBooleanGetValue(onscreen)),
+                        "width": rect.width, "height": rect.height})
+        return out
+    finally:
+        _CF.CFRelease(arr)          # "Copy" in the name: ours to release
+
+
 def _window_infos():
     """Every window of every app (on screen or not), front to back."""
-    opts = Quartz.kCGWindowListOptionAll | Quartz.kCGWindowListExcludeDesktopElements
-    return Quartz.CGWindowListCopyWindowInfo(opts, Quartz.kCGNullWindowID) or []
+    return _window_list(LIST_ALL | LIST_EXCLUDE_DESKTOP)
 
 
-def _is_lightburn(info):
-    return "lightburn" in str(info.get(Quartz.kCGWindowOwnerName, "")).lower()
+def _one_window(wid):
+    """The list entry for one window, or None if it's gone."""
+    return next((w for w in _window_list(LIST_INCLUDING_WINDOW, wid) if w["id"] == wid), None)
 
 
 def find_lightburn_windows(include_minimized=False):
     """IDs of LightBurn's normal windows that are big enough to hold the Laser
     panel. Minimised (or on another Space) windows aren't on screen and can't
     be pictured, so they're only included on request, for their titles."""
-    ids = []
-    for info in _window_infos():
-        if not _is_lightburn(info) or info.get(Quartz.kCGWindowLayer, 0) != 0:
-            continue
-        b = info.get(Quartz.kCGWindowBounds) or {}
-        if b.get("Width", 0) < MIN_W or b.get("Height", 0) < MIN_H:
-            continue
-        if info.get(Quartz.kCGWindowIsOnscreen) or include_minimized:
-            ids.append(int(info[Quartz.kCGWindowNumber]))
-    return ids
+    return [w["id"] for w in _window_infos()
+            if "lightburn" in w["owner"].lower() and w["layer"] == 0
+            and w["width"] >= MIN_W and w["height"] >= MIN_H
+            and (w["onscreen"] or include_minimized)]
 
 
 def lightburn_running():
@@ -73,21 +146,24 @@ def lightburn_running():
 def window_title(wid):
     """A window's title ("" if it has none, or without Screen Recording
     permission)."""
-    for info in Quartz.CGWindowListCopyWindowInfo(
-            Quartz.kCGWindowListOptionIncludingWindow, wid) or []:
-        if int(info.get(Quartz.kCGWindowNumber, -1)) == wid:
-            return str(info.get(Quartz.kCGWindowName) or "")
-    return ""
+    w = _one_window(wid)
+    return w["name"] if w else ""
 
 
 def _cgimage_to_pil(cg):
-    """A CGImage (32-bit BGRA, as window captures come) as an RGB PIL image."""
+    """A CGImage (32-bit BGRA, as window captures come) as an RGB PIL image.
+
+    The pixels are read through memoryview(data), never bytes(data): with
+    pyobjc, bytes() of a CFData makes a copy that is never freed, so every
+    capture leaked the whole picture (~10 MB for a big window; at "Check
+    every 0.1 s" that ran a Mac out of memory in minutes). frombytes()
+    copies the pixels into the image, so nothing points into `data` after."""
     w, h = Quartz.CGImageGetWidth(cg), Quartz.CGImageGetHeight(cg)
     if not w or not h:
         return None
     stride = Quartz.CGImageGetBytesPerRow(cg)
     data = Quartz.CGDataProviderCopyData(Quartz.CGImageGetDataProvider(cg))
-    return Image.frombuffer("RGB", (w, h), bytes(data), "raw", "BGRX", stride, 1)
+    return Image.frombytes("RGB", (w, h), memoryview(data), "raw", "BGRX", stride, 1)
 
 
 def _capture_cg(wid):
@@ -152,10 +228,8 @@ def is_blank(img):
 
 def _points_wide(wid):
     """The window's width in screen points, or 0."""
-    for info in Quartz.CGWindowListCopyWindowInfo(
-            Quartz.kCGWindowListOptionIncludingWindow, wid) or []:
-        return float((info.get(Quartz.kCGWindowBounds) or {}).get("Width", 0))
-    return 0.0
+    w = _one_window(wid)
+    return w["width"] if w else 0.0
 
 
 def capture_best(wid):
