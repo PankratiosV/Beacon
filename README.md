@@ -32,10 +32,14 @@ Windows 10/11 (64-bit) and macOS 12.3 or newer. Free for noncommercial use — s
 **Windows:** download **Beacon-Setup-x.y.z.exe** from the [Releases](../../releases) page and
 run it. Windows may warn that the installer isn't signed: choose *More info › Run anyway*.
 
-**Mac:** download **Beacon-x.y.z.dmg**, open it and drag **Beacon** onto **Applications**
-(or run **Beacon-x.y.z.pkg**). If the build isn't signed, macOS will block the first
-launch. Open *System Settings › Privacy & Security*, scroll down, and choose *Open Anyway*.
-Beacon then asks for:
+**Mac** (Apple Silicon or Intel): download **Beacon-x.y.z.pkg** and double-click it. The
+installer walks you through a few pages, puts Beacon in Applications and opens it. Everything
+Beacon needs is included. If you prefer, download **Beacon-x.y.z.dmg** instead, open it and drag
+**Beacon** onto **Applications**.
+
+If the installer isn't signed, macOS blocks it the first time. Open *System Settings › Privacy &
+Security*, scroll down, choose *Open Anyway*, then open the installer again. Beacon then asks
+for:
 
 - **Screen Recording**: needed to read LightBurn's window. It isn't needed in API-only mode.
 - **Local Network**: needed for the Wi-Fi light, smart plugs and the phone dashboard.
@@ -70,11 +74,12 @@ To build the Mac version, you need Python 3.12 or 3.13 from python.org and the X
 Line Tools (`xcode-select --install`). Run `installer/build_mac.sh`. It writes two files to
 `installer/Output/`:
 
-- `Beacon-<version>.dmg`
-- `Beacon-<version>.pkg`
+- `Beacon-<version>.pkg`: an installer with welcome, license and setup pages
+- `Beacon-<version>.dmg`: a disk image to drag Beacon into Applications
 
-The app is built for the processor of the Mac you build on, Intel or Apple Silicon. Signing and
-notarizing with an Apple Developer ID is optional and described at the top of the script.
+The app is universal: it runs natively on both Apple Silicon and Intel Macs, whichever kind you
+build on. Signing and notarizing with an Apple Developer ID is optional and described at the top
+of the script.
 
 ## Project layout
 

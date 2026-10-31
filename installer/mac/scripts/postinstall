@@ -1,0 +1,8 @@
+#!/bin/sh
+# Runs (as root) after Beacon.app is in place: open it for the person at the
+# screen, as that person (never as root). $2 is the install folder.
+USER_ID=$(stat -f %u /dev/console)
+if [ "$USER_ID" -gt 0 ] 2>/dev/null; then
+    launchctl asuser "$USER_ID" /usr/bin/open "$2/Beacon.app" || true
+fi
+exit 0

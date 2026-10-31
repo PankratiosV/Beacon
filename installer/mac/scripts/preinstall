@@ -1,0 +1,6 @@
+#!/bin/sh
+# Runs (as root) before Beacon.app is copied: quit a running Beacon so an
+# upgrade can replace it. Its settings live outside the app and are kept.
+pkill -x Beacon 2>/dev/null
+sleep 1
+exit 0
