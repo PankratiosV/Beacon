@@ -1,5 +1,17 @@
 # Beacon — Live Laser Status App for LightBurn - BETA
 
+## ⬇️ Download
+
+<!-- These links always point at the newest release. When the version changes, update the
+     file names here to match what's attached to it. -->
+| | |
+|---|---|
+| **Windows 10/11** | **[Download Beacon for Windows](https://github.com/PankratiosV/Beacon/releases/latest/download/Beacon-Setup-2.1.0.exe)** (.exe installer) |
+| **Mac** (Apple Silicon or Intel, macOS 12.3+) | **[Download Beacon for Mac](https://github.com/PankratiosV/Beacon/releases/latest/download/Beacon-2.1.0.pkg)** (.pkg installer) · [.dmg](https://github.com/PankratiosV/Beacon/releases/latest/download/Beacon-2.1.0.dmg) |
+
+All versions and release notes: **[Releases](https://github.com/PankratiosV/Beacon/releases/latest)**.
+Installation help is under [Install](#install) below.
+
 Beacon watches [LightBurn](https://lightburnsoftware.com) and shows what your laser is doing —
 **Running, Paused, Framing, Ready or Disconnected** — in a small window or floating pill, on a
 USB or Wi-Fi **stack light**, and on your phone. It also times every job and keeps statistics.
