@@ -1,0 +1,17 @@
+# What Beacon needs on macOS (the versions the Mac build is tested with).
+# From source:  pip3 install -r installer/requirements-mac.txt
+# build_mac.sh installs these (plus PyInstaller) into build/buildenv-mac.
+customtkinter==6.0.0
+darkdetect==0.8.0
+pillow==12.3.0
+psutil==7.2.2
+pyserial==3.5
+# pyobjc: macOS' own APIs from Python. Quartz finds and captures LightBurn's
+# window, Vision reads its text, Cocoa / UserNotifications do the menu-bar
+# icon and notifications, ScreenCaptureKit is the newer capture API.
+pyobjc-core==11.1
+pyobjc-framework-Cocoa==11.1
+pyobjc-framework-Quartz==11.1
+pyobjc-framework-Vision==11.1
+pyobjc-framework-ScreenCaptureKit==11.1
+pyobjc-framework-UserNotifications==11.1
