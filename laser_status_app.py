@@ -1181,7 +1181,8 @@ class Detector(threading.Thread):
         if not any_capture:
             if IS_MAC and not screen_permission():
                 return None, ("Allow Beacon in System Settings › Privacy & Security › "
-                              "Screen Recording"), all_text, "full"
+                              "Screen & System Audio Recording, then quit and reopen "
+                              "Beacon"), all_text, "full"
             return None, "LightBurn's window captured blank", all_text, "full"
         return None, "Can't see LightBurn's status readout", all_text, "full"
 

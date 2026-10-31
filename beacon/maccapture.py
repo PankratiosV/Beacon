@@ -161,7 +161,14 @@ def _points_wide(wid):
 def capture_best(wid):
     """A picture of the window, whichever way gives a real one, or None.
     Captures are in real pixels (twice the points on a Retina screen);
-    img.info["scale"] says how many, so callers can size boxes in points."""
+    img.info["scale"] says how many, so callers can size boxes in points.
+
+    Nothing is captured without the Screen Recording permission: every
+    attempt makes macOS show its "would like to record this computer's
+    screen" request again, which at one check a second never stops. macOS
+    only applies a newly given permission after Beacon restarts."""
+    if not screen_permission():
+        return None
     for grab in (_capture_cg, _capture_sck):
         try:
             img = grab(wid)
