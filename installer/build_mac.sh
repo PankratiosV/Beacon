@@ -1,14 +1,17 @@
 #!/bin/bash
 # Builds the Mac installer in one go:
 #   1) bundles the app into dist/Beacon.app (no Python needed on customers' Macs)
-#   2) wraps it into installer/Output/Beacon-<version>.dmg (drag to Applications)
-#      and installer/Output/Beacon-<version>.pkg (a classic installer)
+#   2) wraps it into installer/Output/Beacon-<version>.pkg, an installer with
+#      welcome, license and "finish setting up" pages that opens Beacon when
+#      done, and installer/Output/Beacon-<version>.dmg (drag to Applications)
 # Needs (once): Python 3.12 or 3.13 from python.org and the Xcode Command Line
 # Tools (xcode-select --install). The bundling runs in its own environment
 # (build/buildenv-mac) with the versions in requirements-mac.txt.
 #
-# The app is built for this Mac's processor (Intel or Apple Silicon). Build
-# on each kind of Mac for both, or run it on GitHub's macos runners.
+# The app is universal: it runs natively on Apple Silicon and Intel Macs,
+# whichever kind builds it. python.org's Python and pyobjc already are; the
+# packages that only publish one-processor wheels (Pillow, psutil) are
+# downloaded for both and fused into one (delocate-merge).
 #
 # Code signing (optional; without it macOS says the app is from an
 # unidentified developer). With an Apple Developer ID set:
@@ -38,7 +41,29 @@ if [ ! -x "$PY" ]; then
     fi
     "$BASE" -m venv "$ENV"
     "$PY" -m pip install --upgrade pip
-    "$PY" -m pip install -r installer/requirements-mac.txt pyinstaller==6.22.3
+    "$PY" -m pip install -r installer/requirements-mac.txt pyinstaller==6.22.3 delocate==0.13.0
+fi
+
+# Universal Pillow and psutil (see the top). Skipped once they are.
+if ! lipo -archs "$(ls "$ENV"/lib/python3.*/site-packages/PIL/_imaging.*.so)" | grep -q arm64 ||
+   ! lipo -archs "$(ls "$ENV"/lib/python3.*/site-packages/PIL/_imaging.*.so)" | grep -q x86_64 ||
+   ! lipo -archs "$(ls "$ENV"/lib/python3.*/site-packages/psutil/_psutil_osx*.so)" | grep -q arm64 ||
+   ! lipo -archs "$(ls "$ENV"/lib/python3.*/site-packages/psutil/_psutil_osx*.so)" | grep -q x86_64; then
+    echo "Making Pillow and psutil universal - first time only..."
+    "$PY" -m pip install delocate==0.13.0
+    PYVER=$("$PY" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')
+    W=build/wheels
+    rm -rf "$W"
+    for arch in arm64 x86_64; do
+        "$PY" -m pip download --only-binary=:all: --no-deps --python-version "$PYVER" \
+            --platform "macosx_11_0_$arch" --platform "macosx_10_15_$arch" \
+            --platform "macosx_10_13_$arch" --platform "macosx_10_9_$arch" \
+            -d "$W/$arch" $(grep -E '^(pillow|psutil)==' installer/requirements-mac.txt)
+    done
+    for pkg in pillow psutil; do
+        "$ENV/bin/delocate-merge" "$W"/arm64/$pkg-*.whl "$W"/x86_64/$pkg-*.whl -w "$W/universal2"
+    done
+    "$PY" -m pip install --force-reinstall --no-deps "$W"/universal2/*.whl
 fi
 
 echo "[1/4] Making the icon..."
@@ -52,15 +77,17 @@ img.save("build/Beacon.icns")
 EOF
 
 echo "[2/4] Bundling the app..."
-# --windowed makes a .app; --add-data ships the .ico (the menu-bar icon) next
-# to the code, found via sys._MEIPASS; --collect-data customtkinter: its
-# themes and fonts.
-"$PY" -m PyInstaller --noconfirm --clean --windowed \
+# --windowed makes a .app; --target-arch universal2 checks every part runs on
+# both processors; --add-data ships the .ico (the menu-bar icon) next to the
+# code, found via sys._MEIPASS; --collect-data customtkinter: its themes and
+# fonts; certifi: the trusted certificates HTTPS needs (see SSL_CERT_FILE in
+# laser_status_app.py).
+"$PY" -m PyInstaller --noconfirm --clean --windowed --target-arch universal2 \
     --name "Beacon" \
     --icon "$PWD/build/Beacon.icns" \
     --osx-bundle-identifier "$BUNDLE_ID" \
     --add-data "$PWD/laser_status.ico:." \
-    --collect-data customtkinter \
+    --collect-data customtkinter --collect-data certifi \
     --hidden-import beacon.macsys --hidden-import beacon.maccapture \
     --hidden-import Vision --hidden-import ScreenCaptureKit --hidden-import UserNotifications \
     --specpath build \
@@ -102,13 +129,46 @@ ditto dist/Beacon.app "$STAGE/Beacon.app"
 ln -s /Applications "$STAGE/Applications"
 hdiutil create -volname "Beacon $VERSION" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
 
-if [ -n "${INSTALLER_IDENTITY:-}" ]; then
-    pkgbuild --component dist/Beacon.app --install-location /Applications \
-             --identifier "$BUNDLE_ID" --version "$VERSION" --sign "$INSTALLER_IDENTITY" "$PKG"
-else
-    pkgbuild --component dist/Beacon.app --install-location /Applications \
-             --identifier "$BUNDLE_ID" --version "$VERSION" "$PKG"
-fi
+# The .pkg is built in two steps. pkgbuild packs the app with the
+# preinstall / postinstall scripts (installer/mac/scripts). It's told the app
+# is not relocatable: otherwise, if a Beacon.app exists anywhere else on the
+# Mac, Installer "upgrades" that copy instead of putting one in
+# /Applications. Then productbuild wraps it in the installer pages
+# (installer/mac/*.html and the license).
+ROOT=build/pkgroot
+rm -rf "$ROOT" build/pkg
+mkdir -p "$ROOT" build/pkg/resources
+ditto dist/Beacon.app "$ROOT/Beacon.app"
+pkgbuild --analyze --root "$ROOT" build/pkg/component.plist >/dev/null
+plutil -replace 0.BundleIsRelocatable -bool NO build/pkg/component.plist
+pkgbuild --root "$ROOT" --component-plist build/pkg/component.plist \
+         --install-location /Applications --scripts installer/mac/scripts \
+         --identifier "$BUNDLE_ID" --version "$VERSION" build/pkg/Beacon-app.pkg >/dev/null
+cp installer/mac/welcome.html installer/mac/conclusion.html installer/license.txt \
+   build/pkg/resources/
+cat > build/pkg/distribution.xml <<EOF
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+    <title>Beacon $VERSION</title>
+    <welcome file="welcome.html" mime-type="text/html"/>
+    <license file="license.txt"/>
+    <conclusion file="conclusion.html" mime-type="text/html"/>
+    <options customize="never" require-scripts="false" hostArchitectures="arm64,x86_64"/>
+    <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
+    <volume-check>
+        <allowed-os-versions><os-version min="12.3"/></allowed-os-versions>
+    </volume-check>
+    <choices-outline>
+        <line choice="beacon"/>
+    </choices-outline>
+    <choice id="beacon" title="Beacon">
+        <pkg-ref id="$BUNDLE_ID"/>
+    </choice>
+    <pkg-ref id="$BUNDLE_ID" version="$VERSION" onConclusion="none">Beacon-app.pkg</pkg-ref>
+</installer-gui-script>
+EOF
+productbuild --distribution build/pkg/distribution.xml --resources build/pkg/resources \
+             --package-path build/pkg ${INSTALLER_IDENTITY:+--sign "$INSTALLER_IDENTITY"} "$PKG"
 
 if [ -n "${SIGN_IDENTITY:-}" ]; then
     codesign --force --sign "$SIGN_IDENTITY" "$DMG"

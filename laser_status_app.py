@@ -346,6 +346,16 @@ if IS_WIN:
             ctypes.windll.user32.SetProcessDPIAware()
         except Exception:
             pass
+elif "SSL_CERT_FILE" not in os.environ:
+    # macOS: python.org's Python looks for trusted certificates in its own
+    # folder, which a Mac without that Python (every customer's) doesn't have,
+    # so HTTPS (Telegram, Discord, email, updates) would fail. Use the
+    # certificate list bundled with the app (certifi) instead.
+    try:
+        import certifi
+        os.environ["SSL_CERT_FILE"] = certifi.where()
+    except ImportError:
+        pass
 
 
 def open_path(path):
