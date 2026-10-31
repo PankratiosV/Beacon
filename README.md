@@ -7,7 +7,7 @@ Beacon allows for integrating Arduino hardware into your laser workflows, allowi
 
 **MUST HAVE LIGHTBURN LASER WINDOW OPEN IF THE VERSION IS LOWER THAN 2.2; IN VERSION 2.2 LIGHTBURN CAN BE MINIMIZED. Both old and new versions will work with Beacon minimized. Reason - OCR needs screen to be open, and 2.2 version uses API, which allows the LightBurn application to be minimized. 
 **
-Windows 10/11 (64-bit). Free for noncommercial use — see [License](#license).
+Windows 10/11 (64-bit) and macOS 12.3 or newer. Free for noncommercial use — see [License](#license).
 
 ## Features
 
@@ -29,14 +29,27 @@ Windows 10/11 (64-bit). Free for noncommercial use — see [License](#license).
 
 ## Install
 
-Download **Beacon-Setup-x.y.z.exe** from the [Releases](../../releases) page and run it.
-Windows may warn that the installer isn't signed: choose *More info › Run anyway*.
+**Windows:** download **Beacon-Setup-x.y.z.exe** from the [Releases](../../releases) page and
+run it. Windows may warn that the installer isn't signed: choose *More info › Run anyway*.
+
+**Mac:** download **Beacon-x.y.z.dmg**, open it and drag **Beacon** onto **Applications**
+(or run **Beacon-x.y.z.pkg**). If the build isn't signed, macOS will block the first
+launch. Open *System Settings › Privacy & Security*, scroll down, and choose *Open Anyway*.
+Beacon then asks for:
+
+- **Screen Recording**: needed to read LightBurn's window. It isn't needed in API-only mode.
+- **Local Network**: needed for the Wi-Fi light, smart plugs and the phone dashboard.
+- **Notifications**: needed for pop-up alerts.
 
 ## Run from the source
 
 1. Install [Python 3.10+](https://www.python.org/downloads/) (tick *Add Python to PATH*).
 2. Double-click **`Install requirements.bat`** (once).
 3. Double-click **`Start Laser Status.bat`**, or run `pythonw laser_status_app.py`.
+
+On a Mac, install Python 3.12 or 3.13 from python.org. Double-click
+**`Install requirements (Mac).command`** once, then **`Start Beacon (Mac).command`**. You can
+also run `python3 laser_status_app.py` instead of the second file.
 
 ### Dev mode
 
@@ -53,16 +66,26 @@ with the versions in `installer/build-requirements.txt`) and writes
 `installer/Output/Beacon-Setup-<version>.exe`. Optional code signing is described at the top of
 the script.
 
+To build the Mac version, you need Python 3.12 or 3.13 from python.org and the Xcode Command
+Line Tools (`xcode-select --install`). Run `installer/build_mac.sh`. It writes two files to
+`installer/Output/`:
+
+- `Beacon-<version>.dmg`
+- `Beacon-<version>.pkg`
+
+The app is built for the processor of the Mac you build on, Intel or Apple Silicon. Signing and
+notarizing with an Apple Developer ID is optional and described at the top of the script.
+
 ## Project layout
 
 | Path | What |
 |---|---|
 | `laser_status_app.py` | The app: LightBurn readers, window, pill, settings, statistics |
-| `beacon/` | Modules: LightBurn API client, notifications, smart plugs, exports, phone dashboard, updater, Windows integration, detection log |
+| `beacon/` | Modules: LightBurn API client, notifications, smart plugs, exports, phone dashboard, updater, Windows and macOS integration, detection log |
 | `laser_stack_light/` | Arduino Uno sketch (stack light, buzzer, relays, safety inputs) |
 | `esp32_stack_light/` | ESP32 Wi-Fi version of the same |
 | `docs/hardware-kit.md` | Parts list, wiring and safety notes |
-| `installer/` | Inno Setup script, build script, installer license text |
+| `installer/` | Inno Setup script and Windows build script, `build_mac.sh` for the Mac .dmg / .pkg, installer license text |
 
 ## License
 

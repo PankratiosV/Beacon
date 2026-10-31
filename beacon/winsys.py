@@ -30,12 +30,14 @@ RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 
 # ------------------------------------------------------------ start with Windows
-def launch_command(script_path):
-    """The command that starts this app: the .exe when bundled, else pythonw + script."""
+def launch_command(script_path, extra=""):
+    """The command that starts this app: the .exe when bundled, else pythonw +
+    script. extra: more arguments (e.g. "--dev")."""
+    tail = f" {extra}" if extra else ""
     if getattr(sys, "frozen", False):
-        return f'"{sys.executable}" --startup'
+        return f'"{sys.executable}" --startup{tail}'
     pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-    return f'"{pyw if os.path.exists(pyw) else sys.executable}" "{script_path}" --startup'
+    return f'"{pyw if os.path.exists(pyw) else sys.executable}" "{script_path}" --startup{tail}'
 
 
 def autostart_get(name):

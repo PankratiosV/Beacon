@@ -1,5 +1,6 @@
 {
   "version": "2.0.1",
   "url": "https://example.com/downloads/Beacon-Setup-2.0.1.exe",
+  "url_mac": "https://example.com/downloads/Beacon-2.0.1.dmg",
   "notes": "Faster LightBurn detection and a fix for the phone dashboard."
 }

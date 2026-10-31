@@ -2,6 +2,14 @@
 installed (pip install opencv-python-headless); otherwise available() is False
 and the feature explains how to turn it on."""
 
+import sys
+
+
+def _backend(cv2):
+    """OpenCV's capture backend for this system: DirectShow on Windows (opens
+    quickly), AVFoundation on macOS."""
+    return cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_AVFOUNDATION
+
 
 def available():
     """True if OpenCV is installed (camera snapshots possible)."""
@@ -14,11 +22,11 @@ def available():
 
 def list_cameras(max_index=4):
     """Indexes of the cameras that open (0 is usually the built-in one).
-    CAP_DSHOW uses DirectShow, which opens quickly on Windows."""
+    The system's own backend (DirectShow / AVFoundation) opens quickest."""
     import cv2
     found = []
     for i in range(max_index):
-        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+        cap = cv2.VideoCapture(i, _backend(cv2))
         if cap.isOpened():
             found.append(i)
         cap.release()
@@ -31,7 +39,7 @@ def snapshot(index=0, width=1280):
         import cv2
     except ImportError as e:
         raise RuntimeError("Camera support isn't installed.") from e
-    cap = cv2.VideoCapture(int(index), cv2.CAP_DSHOW)
+    cap = cv2.VideoCapture(int(index), _backend(cv2))
     try:
         if not cap.isOpened():
             raise RuntimeError(f"Camera {index} isn't available.")

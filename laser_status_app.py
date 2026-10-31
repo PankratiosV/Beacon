@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Beacon - live laser status for LightBurn (Windows 10/11)
+Beacon - live laser status for LightBurn (Windows 10/11 and macOS 12.3+)
 
 Reads what LightBurn's Laser panel says (Ready / Busy / Paused / Framing /
 Disconnected) and shows it in a small window or floating pill, on an Arduino
@@ -11,12 +11,21 @@ changed: Beacon only reads.
 Setup (once), in a Command Prompt:
     pip install customtkinter pyserial pywin32 pillow psutil winrt-runtime winrt-Windows.Foundation winrt-Windows.Foundation.Collections winrt-Windows.Media.Ocr winrt-Windows.Graphics.Imaging winrt-Windows.Storage.Streams winrt-Windows.Globalization
 (or double-click "Install requirements.bat")
+On macOS, in Terminal:
+    pip3 install -r installer/requirements-mac.txt
+(or double-click "Install requirements (Mac).command")
 
 Run:
-    double-click "Start Laser Status.bat", or:  python laser_status_app.py
+    double-click "Start Laser Status.bat" ("Start Beacon (Mac).command" on a
+    Mac), or:  python laser_status_app.py
     python laser_status_app.py --dev     a separate dev copy (see DEV below)
 
 Settings are saved in %APPDATA%\\LaserStatusV2\\settings.json
+(macOS: ~/Library/Application Support/LaserStatusV2/settings.json)
+
+Platform code: Windows uses Win32 (pywin32), Windows OCR (winrt) and
+beacon/winsys.py; macOS uses Quartz, Vision and beacon/macsys.py +
+beacon/maccapture.py. Both offer the same calls, imported as `osys`.
 
 How the code fits together (top to bottom in this file):
 
@@ -109,16 +118,21 @@ def fatal(msg):
     sys.exit(1)
 
 
-# Beacon uses Win32 APIs (window capture, tray icon, hotkeys, Windows OCR), so
-# it can't run anywhere else.
-if sys.platform != "win32":
-    fatal("This app is for Windows.")
+# Beacon reads other apps' windows through each system's own APIs (Win32 on
+# Windows, Quartz on macOS), so it runs on those two only.
+IS_WIN = sys.platform == "win32"
+IS_MAC = sys.platform == "darwin"
+if not (IS_WIN or IS_MAC):
+    fatal("This app is for Windows and macOS.")
+OS_NAME = "Windows" if IS_WIN else "macOS"
+COMPUTER = "PC" if IS_WIN else "Mac"
 
 # Third-party packages. Each import is tried on its own and the names of the
 # missing ones are collected, so a user running from source learns in one
 # message exactly which `pip install` to run.
 # - customtkinter: the modern-looking widgets the whole UI is built from
 # - pywin32 (win32gui, win32ui, ...): finding and capturing LightBurn's window
+#   on Windows; pyobjc (Quartz, Vision, AppKit) does that on macOS
 # - psutil: telling which process owns a window ("is this LightBurn?")
 # - pillow: images (screen captures, the rounded panels, the tray icon)
 _missing = []
@@ -126,13 +140,21 @@ try:
     import customtkinter as ctk
 except ImportError:
     _missing.append("customtkinter")
-try:
-    import win32con
-    import win32gui
-    import win32ui
-    import win32process
-except ImportError:
-    _missing.append("pywin32")
+if IS_WIN:
+    try:
+        import win32con
+        import win32gui
+        import win32ui
+        import win32process
+    except ImportError:
+        _missing.append("pywin32")
+else:
+    for _mod, _pkg in (("Quartz", "pyobjc-framework-Quartz"), ("Vision", "pyobjc-framework-Vision"),
+                       ("AppKit", "pyobjc-framework-Cocoa")):
+        try:
+            __import__(_mod)
+        except ImportError:
+            _missing.append(_pkg)
 try:
     import psutil
 except ImportError:
@@ -143,7 +165,8 @@ except ImportError:
     _missing.append("pillow")
 if _missing:
     fatal("Missing packages: " + ", ".join(_missing) +
-          "\n\nOpen a Command Prompt and run:\npip install " + " ".join(_missing))
+          ("\n\nOpen a Command Prompt and run:\npip install " if IS_WIN else
+           "\n\nOpen Terminal and run:\npip3 install ") + " ".join(_missing))
 
 
 def _smooth_wheel():
@@ -243,15 +266,21 @@ except ImportError:
 # - smartplugs: Shelly / Tasmota / Home Assistant switches used as relays
 # - updater: checks UPDATE_URL for a newer version
 # - webdash: the phone dashboard (a tiny web server on your Wi-Fi)
-# - winsys: tray icon, global hotkey, autostart, firewall rule, idle time
+# - winsys / macsys (imported as osys): tray or menu-bar icon, global hotkey,
+#   autostart, firewall rule, idle time
 # - lbapi: LightBurn 2.2+ REST API client (the "API" detection mode)
 # - detectlog: the opt-in log of how accurately LightBurn was read
 import logging
 import platform
+import subprocess
 import webbrowser
 import zipfile
-from beacon import camera, channels, exporters, smartplugs, updater, webdash, winsys
+from beacon import camera, channels, exporters, smartplugs, updater, webdash
 from beacon import lbapi
+if IS_WIN:
+    from beacon import winsys as osys
+else:
+    from beacon import macsys as osys
 from beacon.detectlog import DetectionLog
 
 # Where the app looks for updates: a small JSON file you publish (see
@@ -271,7 +300,7 @@ HELP_FAQ = [
      "With LightBurn 2.2 or newer, Settings › Detection › LightBurn API works even "
      "when LightBurn is minimised."),
     ("The status is wrong or flickers.",
-     "Make the Laser panel a little wider so its status line isn't cut off, and keep Windows "
+     "Make the Laser panel a little wider so its status line isn't cut off, and keep the "
      "display scaling the same as when it worked. Settings › Check every 1 s is steadier."),
     ("The Arduino isn't found.",
      "Close the Arduino IDE's Serial Monitor (only one program can use the port), unplug and "
@@ -282,8 +311,10 @@ HELP_FAQ = [
     ("Telegram messages don't arrive.",
      "Send your bot any message first, then press Find to fill in the Chat ID, and Send test."),
     ("My phone can't open the dashboard.",
-     "The phone must be on the same Wi-Fi. Allow Beacon on Private networks in Windows "
-     "Firewall, and check the PIN."),
+     ("The phone must be on the same Wi-Fi. Allow Beacon on Private networks in Windows "
+      "Firewall, and check the PIN." if IS_WIN else
+      "The phone must be on the same Wi-Fi. Allow Beacon in System Settings › Privacy & "
+      "Security › Local Network, and check the PIN.")),
     ("Do safety sensors make the laser safe?",
      "No. They are an extra warning, not a certified safety system. Never leave a running laser "
      "unattended and keep an extinguisher nearby."),
@@ -295,25 +326,35 @@ APP_ID = "LaserStatusV2.Dev" if DEV else "LaserStatusV2.App"
 # Bundled as an .exe (PyInstaller), files like the icon are unpacked to sys._MEIPASS
 BASE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
 ICON_PATH = os.path.join(BASE_DIR, "laser_status.ico")
-try:
-    # Tell Windows this process is "Beacon", not "Python", so the taskbar groups
-    # the window with its pinned shortcut and shows Beacon's icon.
-    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
-except Exception:
-    pass
-
-try:
-    # Per-monitor DPI awareness: without it Windows scales the window as a
-    # blurry bitmap on high-DPI screens, and (important for OCR) window
-    # coordinates and captures would be in scaled pixels that don't match the
-    # real screen. SetProcessDPIAware is the older fallback for Windows versions
-    # without shcore.
-    ctypes.windll.shcore.SetProcessDpiAwareness(2)
-except Exception:
+if IS_WIN:
     try:
-        ctypes.windll.user32.SetProcessDPIAware()
+        # Tell Windows this process is "Beacon", not "Python", so the taskbar
+        # groups the window with its pinned shortcut and shows Beacon's icon.
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
     except Exception:
         pass
+
+    try:
+        # Per-monitor DPI awareness: without it Windows scales the window as a
+        # blurry bitmap on high-DPI screens, and (important for OCR) window
+        # coordinates and captures would be in scaled pixels that don't match
+        # the real screen. SetProcessDPIAware is the older fallback for Windows
+        # versions without shcore.
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
+def open_path(path):
+    """Open a file or folder the way double-clicking it would (Explorer on
+    Windows, Finder or the file's app on macOS)."""
+    if IS_WIN:
+        os.startfile(path)
+    else:
+        subprocess.Popen(["open", path])
 
 
 # ===========================================================================
@@ -328,7 +369,11 @@ except Exception:
 # - sounds/: your own copy of a chosen finish sound
 # - logs/: beacon.log, the app's log (see setup_logging)
 # - detection-check/: the opt-in detection log and its pictures
-CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), SETTINGS_FOLDER)
+if IS_WIN:
+    CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), SETTINGS_FOLDER)
+else:
+    CONFIG_DIR = os.path.join(os.path.expanduser("~/Library/Application Support"),
+                              SETTINGS_FOLDER)
 if DEV:
     CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".devdata")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "settings.json")
@@ -637,6 +682,18 @@ def capture_best(hwnd):
     return None
 
 
+def window_title(hwnd):
+    """A window's title bar text."""
+    return win32gui.GetWindowText(hwnd)
+
+
+# On macOS the same calls come from beacon/maccapture.py (Quartz instead of
+# Win32; window IDs stand in for hwnds), replacing the Windows ones above.
+if IS_MAC:
+    from beacon.maccapture import (VisionOCR, capture_best, find_lightburn_windows,
+                                   lightburn_running, screen_permission, window_title)
+
+
 # ===========================================================================
 # Text recognition. read() returns [(line_text, [(word, x, y, w, h), ...])]
 # with positions in the coordinates of the image passed in.
@@ -748,9 +805,11 @@ class TesseractOCR:
 
     def __init__(self):
         import pytesseract
-        default = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-        if os.path.exists(default):
-            pytesseract.pytesseract.tesseract_cmd = default
+        for default in (r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+                        "/opt/homebrew/bin/tesseract", "/usr/local/bin/tesseract"):
+            if os.path.exists(default):
+                pytesseract.pytesseract.tesseract_cmd = default
+                break
         pytesseract.get_tesseract_version()
         self.pt = pytesseract
 
@@ -776,7 +835,7 @@ def make_ocr():
     """The first OCR engine that starts, as (engine, None), or (None, reasons)
     when none can be used."""
     errors = []
-    for cls in (WindowsOCR, TesseractOCR):
+    for cls in ((WindowsOCR if IS_WIN else VisionOCR), TesseractOCR):
         try:
             return cls(), None
         except Exception as e:
@@ -791,6 +850,8 @@ def make_ocr():
 # words. If several are found on screen (another panel may mention "Ready"), the
 # earliest in this list wins: a job that's running matters more.
 STATUS_WORDS = ["paused", "busy", "framing", "disconnected", "ready"]   # priority order
+if IS_MAC:      # a status box with none of these is read again, more carefully
+    VisionOCR.retry_words = frozenset(STATUS_WORDS)
 
 
 def _close_enough(word, target):
@@ -886,7 +947,7 @@ def lightburn_file_name(windows):
     """The open file's name from LightBurn's title bar, e.g. "Coasters" from
     "Coasters.lbrn2 * - JCZFiber - LightBurn Pro 2.1.04"."""
     for h in windows:
-        title = win32gui.GetWindowText(h)
+        title = window_title(h)
         if "lightburn" in title.lower() and "live framing" not in title.lower():
             name = title.split(" - ")[0].strip().rstrip("*").strip()
             name = re.sub(r"\.lbrn2?$", "", name, flags=re.I)
@@ -1013,7 +1074,7 @@ class Detector(threading.Thread):
         a quick read of the button's area, and a full read of the window at
         most once per FULL_SCAN_GAP when the button isn't where it was."""
         hwnd = next((h for h in windows
-                     if "live framing" in win32gui.GetWindowText(h).lower()), None)
+                     if "live framing" in window_title(h).lower()), None)
         if hwnd is None:
             self.lf_region, self.lf_word = None, None
             return None
@@ -1098,13 +1159,19 @@ class Detector(threading.Thread):
                     # also hold the Pause/Resume button row, so the next quick
                     # reads can still tell Paused from Busy.
                     x, y, w, h = rect
+                    # k: pixels per screen point (2 for a Retina Mac capture,
+                    # see beacon/maccapture.py), so the box covers the same area
+                    k = img.info.get("scale", 1)
                     # tall enough to include the Pause/Resume button row below
-                    self.region = (hwnd, (max(0, int(x - 30)), max(0, int(y - 18)),
-                                          int(x + 380), int(y + h * 8 + 18)))
+                    self.region = (hwnd, (max(0, int(x - 30 * k)), max(0, int(y - 18 * k)),
+                                          int(x + 380 * k), int(y + h * 8 + 18 * k)))
                     x0, y0, x1, y1 = self.region[1]
                     self.crop = img.crop((x0, y0, min(x1, img.width), min(y1, img.height)))
                 return self.refine(status, windows), "", all_text, "full"
         if not any_capture:
+            if IS_MAC and not screen_permission():
+                return None, ("Allow Beacon in System Settings › Privacy & Security › "
+                              "Screen Recording"), all_text, "full"
             return None, "LightBurn's window captured blank", all_text, "full"
         return None, "Can't see LightBurn's status readout", all_text, "full"
 
@@ -1401,7 +1468,8 @@ def list_ports():
         return []
     out = []
     for p in serial.tools.list_ports.comports():
-        if "bluetooth" in (p.description or "").lower():
+        # macOS names it in the device path (/dev/cu.Bluetooth-Incoming-Port)
+        if "bluetooth" in f"{p.description or ''} {p.device}".lower():
             continue
         out.append((p.device, p.description or p.device))
     return out
@@ -1414,7 +1482,7 @@ def find_arduino_port():
     if not HAVE_SERIAL:
         return None
     for p in serial.tools.list_ports.comports():
-        text = f"{p.description or ''} {p.manufacturer or ''} {p.hwid or ''}".lower()
+        text = f"{p.description or ''} {p.manufacturer or ''} {p.hwid or ''} {p.device}".lower()
         if "bluetooth" in text:
             continue
         if any(k in text for k in ("arduino", "ch340", "usb-serial", "usb serial",
@@ -1915,7 +1983,10 @@ KEY_COLOR = ("#F4F5F7", "#010203")
 PILL_PAD = 10           # compact pill: gap around the dot, between dot and text, and at the ends
 PILL_TEXT_LIFT = 5      # compact pill: raises the text this much (x2) to centre it optically
 
-FONT = "Segoe UI"
+FONT = "Segoe UI" if IS_WIN else "Helvetica Neue"
+MONO_FONT = "Consolas" if IS_WIN else "Menlo"
+# Right mouse button: Tk on macOS calls it button 2, and Control-click counts too
+RIGHT_CLICK = ("<Button-3>",) if IS_WIN else ("<Button-2>", "<Control-Button-1>")
 
 
 def pick(pair):
@@ -2134,8 +2205,45 @@ class ChimePlayer:
                 pass
 
 
+class MacChimePlayer:
+    """The same player on macOS, through the built-in `afplay` (MP3, WAV, M4A,
+    AIFF; not WMA). Each sound is its own afplay process, so stop() just ends
+    it."""
+    DEFAULT = "/System/Library/Sounds/Glass.aiff"
+
+    def __init__(self):
+        self._proc = None
+
+    def play(self, path):
+        """Starts playing without waiting. False if it couldn't even start."""
+        self.stop()
+        if not path or not os.path.exists(path):
+            return False
+        try:
+            self._proc = subprocess.Popen(["afplay", path], stdout=subprocess.DEVNULL,
+                                          stderr=subprocess.DEVNULL)
+            return True
+        except OSError:
+            return False
+
+    def check(self, path, timeout=3.0):
+        """Plays the file; False if afplay gives up on it within half a second
+        (it exits at once with an error for files it can't decode)."""
+        if not self.play(path):
+            return False
+        try:
+            return self._proc.wait(timeout=min(timeout, 0.5)) == 0
+        except subprocess.TimeoutExpired:
+            return True                 # still playing: it works
+
+    def stop(self):
+        if self._proc and self._proc.poll() is None:
+            self._proc.terminate()
+        self._proc = None
+
+
 # One shared player for the whole app, plus short helpers used by the UI.
-CHIME = ChimePlayer()
+CHIME = ChimePlayer() if IS_WIN else MacChimePlayer()
 
 
 def play_sound(path):
@@ -2147,7 +2255,7 @@ def stop_sound():
 
 
 def play_chime(path):
-    """The chosen sound, or the Windows chime if there isn't one (or it won't play)."""
+    """The chosen sound, or the system chime if there isn't one (or it won't play)."""
     if play_sound(path):
         return
     if winsound:
@@ -2155,10 +2263,21 @@ def play_chime(path):
             winsound.MessageBeep(winsound.MB_ICONASTERISK)
         except Exception:
             pass
+    elif IS_MAC:
+        play_sound(MacChimePlayer.DEFAULT)
 
 
 def set_window_key(win):
-    """Make the current theme's KEY_COLOR see-through in a borderless window."""
+    """Make the current theme's KEY_COLOR see-through in a borderless window.
+    macOS has no colour key; there the window itself is made transparent and
+    whatever is drawn in "systemTransparent" (see RoundPanel) shows through."""
+    if IS_MAC:
+        win.configure(bg="systemTransparent")
+        try:
+            win.attributes("-transparent", True)
+        except tk.TclError:
+            pass
+        return
     key = pick(KEY_COLOR)
     win.configure(bg=key)
     try:
@@ -2297,6 +2416,9 @@ class RoundPanel(tk.Canvas):
         if args == self._drawn:
             return
         self._drawn = args
+        if IS_MAC and self.hard_edge:
+            self._draw_shape(*args[:7])
+            return
         self.configure(bg=args[-2])
         # Recently drawn looks are kept, so flipping Running <-> Ready is instant
         key = args + (id(self.tk),)         # images belong to one Tk instance
@@ -2308,6 +2430,19 @@ class RoundPanel(tk.Canvas):
         self._img = img
         self.delete("panel")
         self.create_image(0, 0, anchor="nw", image=self._img, tags="panel")
+        self.tag_lower("panel")
+
+    def _draw_shape(self, w, h, r, fill, outline, width, dash):
+        """macOS, see-through window: a see-through canvas there draws shapes
+        but not pictures, so the panel is a rounded polygon instead (macOS
+        smooths its edges itself)."""
+        self.configure(bg="systemTransparent")
+        half = width / 2
+        pts = rounded_path(half, half, w - half, h - half, max(0.0, r - half), 2)
+        self.delete("panel")
+        self.create_polygon([c for p in pts for c in p], fill=fill, outline=outline,
+                            width=width, dash=tuple(round(d) for d in dash) if dash else "",
+                            tags="panel")
         self.tag_lower("panel")
 
 
@@ -2500,11 +2635,20 @@ class App:
             "Error in the window", exc_info=exc)
         self.root.attributes("-alpha", 0.0)     # revealed once drawn (see reveal_window)
         self.root.title(WINDOW_TITLE)
-        if os.path.exists(ICON_PATH):
+        if IS_WIN and os.path.exists(ICON_PATH):    # a Mac app's icon comes from its bundle
             try:
                 self.root.iconbitmap(ICON_PATH)
             except tk.TclError:
                 pass
+        if IS_MAC:
+            # The Dock icon clicked (with every window hidden), Beacon › Settings…
+            # (⌘,) and Beacon › Quit (⌘Q): Tk calls these by name
+            self.root.createcommand("::tk::mac::ReopenApplication",
+                                    lambda *a: self.bring_to_front_full())
+            self.root.createcommand("::tk::mac::ShowPreferences",
+                                    lambda *a: (self.bring_to_front_full(),
+                                                self.show_page("settings")))
+            self.root.createcommand("::tk::mac::Quit", lambda *a: self.quit())
         self.root.geometry("380x560")
         self.root.minsize(340, 500)
         self.root.attributes("-topmost", self.s["topmost"])
@@ -2600,7 +2744,7 @@ class App:
         # middle of that dispatch, where touching Tk crashes Python, so its
         # callbacks are handed over with post=self._on_ui and run on the next
         # poll() (see beacon/winsys.py).
-        self.tray = winsys.TrayHost(APP_NAME, ICON_PATH,
+        self.tray = osys.TrayHost(APP_NAME, ICON_PATH,
                                     on_menu=lambda x, y: self.show_tray_menu(x, y),
                                     on_open=self.bring_to_front_full, on_hotkey=self.hotkey_pressed,
                                     post=self._on_ui)
@@ -2778,7 +2922,7 @@ class App:
         "notifications": "What to be told, quiet hours, channels",
         "display": "Blink, always on top, chime, appearance",
         "reports": "Hourly, daily and weekly laser-time reports",
-        "windows": "Start with Windows, tray icon, shortcut",
+        "windows": ("Start with Windows, tray icon, shortcut" if IS_WIN else "Open at login, menu bar icon, shortcut"),
         "shop": "Opening hours and weekly goal",
         "test": "Try the app without the laser",
         "help": "Help, setup assistant, updates",
@@ -3089,7 +3233,7 @@ class App:
 
         # --- Notifications
         box = self.section(body, "Notifications", "notifications")
-        self.switch_row(box, "notify_pc", "Windows notifications",
+        self.switch_row(box, "notify_pc", f"{OS_NAME} notifications",
                         "Pop-ups in the corner of the screen", on_change=self._pc_notify_changed)
         PlainLabel(box, text="Notify me when", font=self.font(13), text_color=TEXT,
                      anchor="w").pack(fill="x", padx=14, pady=(10, 2))
@@ -3173,7 +3317,7 @@ class App:
 
         PlainLabel(box, text="Send reports to", font=self.font(13), text_color=TEXT,
                      anchor="w").pack(fill="x", padx=14, pady=(8, 2))
-        for key, label in (("report_tg", "Telegram"), ("report_pc", "Windows notifications"),
+        for key, label in (("report_tg", "Telegram"), ("report_pc", f"{OS_NAME} notifications"),
                            ("report_other", "Discord, Pushover and email (if set up)")):
             var = ctk.BooleanVar(value=bool(self.s[key]))
             ctk.CTkCheckBox(box, text=label, variable=var, font=self.font(12),
@@ -3212,17 +3356,19 @@ class App:
         self.port_status.pack(fill="x", padx=14, pady=(0, 10))
 
         # --- Windows
-        box = self.section(body, "Windows", "windows")
-        self.switch_row(box, "autostart", "Start with Windows",
+        box = self.section(body, OS_NAME, "windows")
+        self.switch_row(box, "autostart", "Start with Windows" if IS_WIN else "Open at login",
                         "Opens as the compact pill when you sign in",
                         on_change=self.apply_windows_settings)
-        self.switch_row(box, "tray_always", "Icon by the clock",
-                        "Right-click it to show, mute or quit",
+        self.switch_row(box, "tray_always", "Icon by the clock" if IS_WIN else "Menu bar icon",
+                        "Right-click it to show, mute or quit" if IS_WIN else
+                        "Click it to show, mute or quit",
                         on_change=self.apply_windows_settings)
         self.switch_row(box, "hotkey_on", "Keyboard shortcut",
                         "Show / hide from anywhere", on_change=self.apply_windows_settings)
         self.menu_row(box, "hotkey_key", "Shortcut", None,
-                      {k: f"Ctrl + Alt + {k}" for k in "BLSJ"},
+                      {k: (f"Ctrl + Alt + {k}" if IS_WIN else f"⌃ ⌥ {k}")
+                       for k in "BLSJ"},
                       on_change=self.apply_windows_settings, width=140)
         self.hotkey_status = self.note(box, "", pady=(0, 8))
 
@@ -3270,7 +3416,7 @@ class App:
         box = self.section(body, "Diagnostics", "diagnostics")
         self.switch_row(box, "diagnostics", "Show what it reads",
                         "Helpful if the status looks wrong")
-        self.diag = ctk.CTkTextbox(box, height=130, font=ctk.CTkFont(family="Consolas", size=11),
+        self.diag = ctk.CTkTextbox(box, height=130, font=ctk.CTkFont(family=MONO_FONT, size=11),
                                    corner_radius=10, wrap="word")
         self.diag.pack(fill="x", padx=12, pady=(0, 12))
         self.diag.configure(state="disabled")
@@ -3543,7 +3689,8 @@ class App:
             widget.bind("<ButtonPress-1>", self._pill_press, add="+")
             widget.bind("<B1-Motion>", self._pill_drag, add="+")
             widget.bind("<Double-Button-1>", lambda e: self.leave_compact(), add="+")
-            widget.bind("<Button-3>", self.show_pill_menu, add="+")
+            for button in RIGHT_CLICK:
+                widget.bind(button, self.show_pill_menu, add="+")
             for child in widget.winfo_children():
                 bind_all(child)
         bind_all(self.pill)
@@ -3572,7 +3719,18 @@ class App:
     def popup_menu(self, x, y, items, above=False):
         """Show the app's own popup menu at screen position (x, y). items:
         [(text, command), ...]. above=True opens it up and to the left of the
-        point, which is where there's room next to the tray icon."""
+        point, which is where there's room next to the tray icon.
+
+        On macOS it's a native menu instead: borderless Tk windows can't take
+        keyboard focus there, so the click-outside-to-close check wouldn't
+        work, and a Mac menu already follows Light / Dark."""
+        if IS_MAC:
+            menu = self._mac_menu = tk.Menu(self.root, tearoff=0)
+            for text, command in items:
+                menu.add_command(label=text, command=command)
+            osys.activate_app()
+            menu.tk_popup(int(x), int(y))
+            return
         box = self.pill_menu_box
         for w in box.winfo_children():
             w.destroy()
@@ -3679,7 +3837,7 @@ class App:
     def open_check_folder(self):
         """Open the detection check folder in Explorer."""
         os.makedirs(self.checklog.folder, exist_ok=True)
-        os.startfile(self.checklog.folder)
+        open_path(self.checklog.folder)
 
     def reset_check(self):
         """Delete the detection check log after asking, and start counting
@@ -3805,7 +3963,7 @@ class App:
             messagebox.showerror(APP_NAME, f"Couldn't copy the sound:\n{e}", parent=self.root)
             return
         if not CHIME.check(dest):       # plays it once as a preview, too
-            messagebox.showerror(APP_NAME, "Windows can't play that file. Try an MP3 or WAV.",
+            messagebox.showerror(APP_NAME, f"{OS_NAME} can't play that file. Try an MP3 or WAV.",
                                  parent=self.root)
             self._remove_sounds(keep=self.s["chime_file"])
             return
@@ -3841,7 +3999,7 @@ class App:
         f = self.s["chime_file"]
         custom = bool(f) and os.path.exists(f)
         self.chime_name.configure(text="\u266a  " + os.path.basename(f) if custom
-                                  else "Windows default chime  \u00b7  choose an MP3 to use your own")
+                                  else f"{OS_NAME} default chime  \u00b7  choose an MP3 to use your own")
         self.chime_reset_btn.configure(state="normal" if custom else "disabled")
 
     # ------------------------------------------------------- notifications
@@ -3919,8 +4077,8 @@ class App:
         with the result shown under the button."""
         sent = []
         if self.s["notify_pc"]:
-            self.tray.show(f"\U0001F514 {APP_NAME} test", "Windows notifications are working.")
-            sent.append("Windows")
+            self.tray.show(f"\U0001F514 {APP_NAME} test", f"{OS_NAME} notifications are working.")
+            sent.append(OS_NAME)
         token, chat = self.s["tg_token"], self.s["tg_chat"]
         if token and chat:
             self.tg_status.configure(text="Sending…", text_color=MUTED)
@@ -3931,15 +4089,15 @@ class App:
                         "chat_id": chat,
                         "text": f"\U0001F514 {APP_NAME} test\nTelegram notifications are working."})
                     self._tg_status("Test sent to Telegram ✓"
-                                    + (" and Windows" if sent else ""))
+                                    + (f" and {OS_NAME}" if sent else ""))
                 except RuntimeError as e:
                     self._tg_status(str(e), ok=False)
             threading.Thread(target=work, daemon=True).start()
         elif sent:
-            self.tg_status.configure(text="Windows test sent. Add a bot token and chat ID "
+            self.tg_status.configure(text=f"{OS_NAME} test sent. Add a bot token and chat ID "
                                           "for Telegram.", text_color=MUTED)
         else:
-            self.tg_status.configure(text="Turn on Windows notifications or set up Telegram "
+            self.tg_status.configure(text=f"Turn on {OS_NAME} notifications or set up Telegram "
                                           "first.", text_color=RED)
 
     def notify(self, event, title, body, photo=False):
@@ -4022,7 +4180,7 @@ class App:
         where = []
         if (s["report_pc"] if report else s["notify_pc"]):
             self.tray.show(title, body)
-            where.append("Windows")
+            where.append(OS_NAME)
         # Each channel that's set up becomes a (name, send function) job. The
         # sends happen on one background thread (network calls can take
         # seconds), one after the other; a failing channel doesn't stop the
@@ -4168,8 +4326,8 @@ class App:
         if not where:
             self.report_status.configure(text="Choose where to send reports, and set up Telegram "
                                               "above if you want them there.", text_color=RED)
-        elif where == ["Windows"]:
-            self.report_status.configure(text="Report shown as a Windows notification ✓",
+        elif where == [OS_NAME]:
+            self.report_status.configure(text=f"Report shown as a {OS_NAME} notification ✓",
                                          text_color=MUTED)
         else:
             self.report_status.configure(text="Sending…", text_color=MUTED)
@@ -4260,7 +4418,7 @@ class App:
         if mode in ("ocr", "both") and self.ocr is None:
             self.detect_seg.set(self.DETECT_MODES["api"])
             self.api_status.configure(text="Screen reading isn't available on this PC "
-                                           "(Windows text recognition didn't start).",
+                                           f"({OS_NAME} text recognition didn't start).",
                                       text_color=RED)
             return
         if mode == self.s["detect_mode"]:
@@ -4457,7 +4615,8 @@ class App:
                                   font=self.font(12, "bold"),
                                   command=lambda i=i: self.toggle_relay(i))
                 b.grid(row=n // cols, column=n % cols, padx=3, pady=3, sticky="ew")
-                b.bind("<Button-3>", lambda e, i=i: self.rename_relay(i))
+                for button in RIGHT_CLICK:
+                    b.bind(button, lambda e, i=i: self.rename_relay(i))
                 self.relay_buttons[i] = b
             for col in range(cols):
                 self.relay_panel.grid_columnconfigure(col, weight=1, uniform="relay")
@@ -5159,7 +5318,7 @@ class App:
         # --- nobody at the PC while the laser runs
         unatt = int(s["unattended_min"] or 0)
         if st == "busy" and unatt and "unattended" not in self.job_alerts:
-            idle = winsys.idle_seconds()
+            idle = osys.idle_seconds()
             if idle > unatt * 60:
                 self.job_alerts.add("unattended")
                 for link in (self.arduino, self.netlight):
@@ -5363,7 +5522,7 @@ class App:
         port = self.s["dash_port"]
 
         def work():
-            ok = winsys.firewall_allowed(port, f"{APP_NAME} phone dashboard")
+            ok = osys.firewall_allowed(port, f"{APP_NAME} phone dashboard")
             self._on_ui(lambda: self._show_firewall(ok))
         threading.Thread(target=work, daemon=True).start()
 
@@ -5371,7 +5530,9 @@ class App:
         """Show the firewall result on the Phone & Wi-Fi page (None = unknown)."""
         self._fw_ok = ok
         if ok:
-            self.fw_status.configure(text="✓ Allowed through Windows Firewall", text_color=MUTED)
+            self.fw_status.configure(text=("✓ Allowed through Windows Firewall" if IS_WIN else
+                                           "✓ The macOS firewall is off: phones can connect"),
+                                     text_color=MUTED)
             self.fw_btn.pack_forget()
         elif ok is False:
             self.fw_status.configure(text="Windows Firewall is blocking phones: press Allow on "
@@ -5383,7 +5544,7 @@ class App:
         """The "Allow on Wi-Fi" button: add a Windows Firewall rule for the
         dashboard port. Windows asks for administrator permission; the result
         is checked again 3 seconds later."""
-        if not winsys.firewall_allow(self.s["dash_port"], f"{APP_NAME} phone dashboard"):
+        if not osys.firewall_allow(self.s["dash_port"], f"{APP_NAME} phone dashboard"):
             self.fw_status.configure(text="Not allowed: Windows asked for permission and it "
                                           "was declined.", text_color=RED)
             return
@@ -5508,15 +5669,16 @@ class App:
 
     # ================================================ Windows: tray, hotkey
     def apply_windows_settings(self):
-        """Apply the Windows settings: the "Start with Windows" registry entry
-        (started with --startup, which opens straight into the pill), the
-        tray icon, and the global hotkey Ctrl+Alt+<key>. The hotkey can fail
-        if another app already owns it, which is shown under the setting."""
+        """Apply the system settings: the "Start with Windows" registry entry
+        (macOS: an "open at login" LaunchAgent), started with --startup,
+        which opens straight into the pill; the tray (menu-bar) icon; and the
+        global hotkey Ctrl+Alt+<key> (Control+Option on a Mac). The hotkey
+        can fail if another app already owns it, shown under the setting."""
         s = self.s
         try:
-            winsys.autostart_set(APP_NAME, bool(s["autostart"]),
-                                 winsys.launch_command(os.path.abspath(__file__))
-                                 + (" --dev" if DEV else ""))
+            osys.autostart_set(APP_NAME, bool(s["autostart"]),
+                               osys.launch_command(os.path.abspath(__file__),
+                                                   "--dev" if DEV else ""))
         except OSError as e:
             logging.warning("autostart: %s", e)
         if s["tray_always"]:
@@ -5640,7 +5802,7 @@ class App:
                           "sensor_temp", "sensor_door", "sensor_flow", "autostart") if s.get(k)]
         lines = [f"{APP_NAME} {APP_VERSION}", f"Python {sys.version.split()[0]} "
                  f"({'bundled' if getattr(sys, 'frozen', False) else 'script'})",
-                 f"Windows {platform.version()} {platform.machine()}",
+                 (f"Windows {platform.version()}" if IS_WIN else f"macOS {platform.mac_ver()[0]}") + f" {platform.machine()}",
                  f"Reader: {self.DETECT_MODES[s['detect_mode']]} (screen OCR: {self.ocr_name}, "
                  f"API key: {'yes' if s['lb_api_secret'] else 'no'})   "
                  f"check every {s['interval']} s",
@@ -5689,7 +5851,7 @@ class App:
     def open_settings_folder(self):
         """Open the settings folder in Explorer."""
         os.makedirs(CONFIG_DIR, exist_ok=True)
-        os.startfile(CONFIG_DIR)
+        open_path(CONFIG_DIR)
 
     # ======================================================== shop & goals
     def shop_seconds(self, start, end):
@@ -5893,8 +6055,12 @@ class App:
         self.fw_btn.pack(side="left", padx=6)
         self.dash_status = self.note(box, "", pady=(6, 0))
         self.fw_status = self.note(box, "", pady=(4, 0))
-        self.note(box, "Your phone must be on the same Wi-Fi as this PC. Windows Firewall blocks "
-                       "phones until you press Allow on Wi-Fi once (it asks for permission).",
+        self.note(box, ("Your phone must be on the same Wi-Fi as this PC. Windows Firewall "
+                        "blocks phones until you press Allow on Wi-Fi once (it asks for "
+                        "permission)." if IS_WIN else
+                        "Your phone must be on the same Wi-Fi as this Mac. The first time, "
+                        "macOS asks whether Beacon may accept incoming connections and find "
+                        "devices on the local network: allow both."),
                   pady=(4, 10))
         self._fw_ok = None
         self.check_firewall()
@@ -6043,7 +6209,7 @@ class App:
         for line in ("Reads LightBurn's status: from the screen, LightBurn's API, or both",
                      "Drives a red / green stack light and buzzer on an Arduino",
                      "Relay buttons for a fan, air assist, exhaust and more",
-                     "Messages on Telegram, Windows pop-ups and more",
+                     f"Messages on Telegram, {OS_NAME} pop-ups and more",
                      "Run-time reports, job statistics, costs and quotes"):
             self._wiz_text("•  " + line, color=TEXT, pady=(1, 1))
         self._wiz_text("The next pages show each feature and where to set it up in "
@@ -6169,9 +6335,9 @@ class App:
         avoids nagging."""
         self.wiz_title.configure(text="5  ·  Notifications")
         self._wiz_text("Each event can be switched on or off in Settings › Notifications. "
-                       "Windows pop-ups and Telegram both follow these choices.")
+                       f"{OS_NAME} pop-ups and Telegram both follow these choices.")
         box = self._wiz_card()
-        self.switch_row(box, "notify_pc", "Windows pop-ups", None,
+        self.switch_row(box, "notify_pc", f"{OS_NAME} pop-ups", None,
                         on_change=self._pc_notify_changed)
         for key, label in NOTIFY_EVENTS[:5]:
             var = ctk.BooleanVar(value=bool(self.s[f"notify_{key}"]))
@@ -6360,6 +6526,8 @@ class App:
             return
         self.root.deiconify()
         self.root.attributes("-alpha", 1.0)
+        if IS_MAC:
+            osys.activate_app()                      # macOS only raises the active app
         self.root.attributes("-topmost", True)       # get past Windows' focus rules...
         self.root.lift()
         self.root.focus_force()
@@ -7336,7 +7504,7 @@ class StatsView:
             return
         self.month_status.configure(text="Saved ✓")
         try:
-            os.startfile(path)
+            open_path(path)
         except OSError:
             pass
 
@@ -7602,6 +7770,8 @@ def main():
         else:
             fatal("Couldn't start text recognition.\n\n" + err +
                   "\n\nInstall the packages listed at the top of laser_status_app.py.")
+    if IS_MAC and ocr is not None and load_settings()["detect_mode"] != "api":
+        screen_permission(ask=True)     # macOS asks once; reading the screen needs it
     app = App(ocr)
     if server:
         app.listen_for_launches(server)
