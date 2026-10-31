@@ -13,8 +13,13 @@
 # packages that only publish one-processor wheels (Pillow, psutil) are
 # downloaded for both and fused into one (delocate-merge).
 #
-# Code signing (optional; without it macOS says the app is from an
-# unidentified developer). With an Apple Developer ID set:
+# Code signing. macOS remembers permissions (Screen Recording above all) by
+# the app's signature. Ad hoc, each build has a new identity and users must
+# allow Beacon again after every update, so the app is signed with the
+# self-signed certificate "Beacon Self-Signed" when it's in the keychain
+# (its identity stays the same from build to build; keep a backup of it, see
+# the README). macOS still calls the app's developer unidentified; only an
+# Apple Developer ID changes that. With one set:
 #   export SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"
 #   export INSTALLER_IDENTITY="Developer ID Installer: Your Name (TEAMID)"
 # and to notarize too (after `xcrun notarytool store-credentials beacon`):
@@ -110,13 +115,21 @@ set_key NSHumanReadableCopyright string "Copyright (c) 2026 the Beacon project. 
 
 echo "[3/4] Signing..."
 # Changing Info.plist breaks PyInstaller's signature, so the app is always
-# signed again: with your Developer ID if set, else ad hoc ("-"), which macOS
-# accepts for apps the user opens with Open Anyway.
+# signed again: with your Developer ID if set; else with the self-signed
+# certificate (no hardened runtime: without a Team ID it would refuse to load
+# the app's own libraries); else ad hoc ("-"). macOS accepts all three for
+# apps the user opens with Open Anyway.
+SELF_SIGNED="Beacon Self-Signed"
 if [ -n "${SIGN_IDENTITY:-}" ]; then
     codesign --force --deep --options runtime --timestamp --sign "$SIGN_IDENTITY" dist/Beacon.app
+elif security find-certificate -c "$SELF_SIGNED" >/dev/null 2>&1; then
+    codesign --force --deep --sign "$SELF_SIGNED" dist/Beacon.app
 else
+    echo "WARNING: \"$SELF_SIGNED\" isn't in the keychain, so the app is signed ad hoc and users"
+    echo "         will have to allow Screen Recording again after updating to this build."
     codesign --force --deep --sign - dist/Beacon.app
 fi
+codesign -d -r- dist/Beacon.app 2>&1 | grep designated
 
 echo "[4/4] Building the installers..."
 mkdir -p "$OUT"

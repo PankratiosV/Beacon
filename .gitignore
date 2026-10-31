@@ -8,3 +8,8 @@ dist/
 installer/Output/
 # Dev mode's own settings, stats and logs (laser_status_app.py --dev)
 .devdata/
+# Code-signing keys and certificates (never publish these)
+*.p12
+*.key
+*.cer
+*.crt
