@@ -93,6 +93,15 @@ The app is universal: it runs natively on both Apple Silicon and Intel Macs, whi
 build on. Signing and notarizing with an Apple Developer ID is optional and described at the top
 of the script.
 
+Without a Developer ID, the script signs Beacon with a self-signed certificate called
+**Beacon Self-Signed**, if it's in your keychain. That keeps the app's identity the same from
+build to build, so users don't have to allow Screen Recording again after every update.
+Every release must be signed with the same certificate:
+
+- Keep a backup of its `.p12` file and password somewhere safe and private.
+- Never commit them; `.gitignore` excludes them.
+- To build on another Mac, double-click the `.p12` there to add it to that Mac's keychain.
+
 ## Project layout
 
 | Path | What |
