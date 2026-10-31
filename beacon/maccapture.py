@@ -326,20 +326,22 @@ class VisionOCR:
                 cands = obs.topCandidates_(1)
                 if not cands:
                     continue
-                cand = cands[0]
-                text = str(cand.string())
-                words = []
-                pos = 0
+                text = str(cands[0].string())
+                # Vision's boxes are 0-1 with the origin at the bottom left
+                r = obs.boundingBox()
+                lx, ly = r.origin.x * W, (1 - r.origin.y - r.size.height) * H
+                lw, lh = r.size.width * W, r.size.height * H
+                # Each word's box is its share of the line's box, by character
+                # position. Asking Vision for every word's exact box
+                # (boundingBoxForRange) left ~190 KB of wrapper objects behind
+                # per whole-window read, never freed. Measured on LightBurn:
+                # the status word's box comes out identical, 95% of words
+                # within 13 px.
+                n, pos, words = max(1, len(text)), 0, []
                 for word in text.split():
                     start = text.index(word, pos)
                     pos = start + len(word)
-                    box, _ = cand.boundingBoxForRange_error_((start, len(word)), None)
-                    if box is None:
-                        continue
-                    r = box.boundingBox()
-                    # Vision's boxes are 0-1 with the origin at the bottom left
-                    x, y = r.origin.x * W, (1 - r.origin.y - r.size.height) * H
-                    words.append((word, x / scale, y / scale,
-                                  r.size.width * W / scale, r.size.height * H / scale))
+                    words.append((word, (lx + lw * start / n) / scale, ly / scale,
+                                  lw * len(word) / n / scale, lh / scale))
                 out.append((text, words))
         return out
