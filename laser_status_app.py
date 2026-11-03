@@ -406,6 +406,7 @@ CONFIG_PATH = os.path.join(CONFIG_DIR, "settings.json")
 # file on the next save. Keys are grouped by the Settings section using them.
 DEFAULTS = {
     "blink": False,          # blink for Framing / Disconnected
+    "animate": True,         # Running's glow breathes, Framing's ring and outline move, colours fade
     "topmost": True,
     "chime": False,          # sound when a job finishes
     "chime_file": "",        # own copy of the chosen sound ("" = Windows chime)
@@ -2404,9 +2405,11 @@ def rounded_path(x0, y0, x1, y1, r, step):
     return pts
 
 
-def dash_runs(pts, on, off):
-    """Cuts a path into the "on" stretches of an on/off dash pattern."""
-    runs, cur, pos = [], [pts[0]], 0.0
+def dash_runs(pts, on, off, shift=0.0):
+    """Cuts a path into the "on" stretches of an on/off dash pattern. shift
+    (0-1, a fraction of one dash + gap) moves the dashes forward along the
+    path: stepping it makes them march, like LightBurn's framing line."""
+    runs, cur, pos = [], [pts[0]], -shift * (on + off)
     for a, b in zip(pts, pts[1:]):
         pos += math.hypot(b[0] - a[0], b[1] - a[1])
         if pos % (on + off) < on:
@@ -2421,9 +2424,10 @@ def dash_runs(pts, on, off):
     return runs
 
 
-def panel_image(w, h, r, fill, outline, width, dash, behind, hard_edge=False):
+def panel_image(w, h, r, fill, outline, width, dash, behind, hard_edge=False, shift=0.0):
     """A rounded panel as one smoothed image: drawn 2-3x larger, then scaled down
-    (2x for big panels keeps it quick; it still looks smooth).
+    (2x for big panels keeps it quick; it still looks smooth). shift: see
+    dash_runs.
 
     hard_edge: for see-through windows. Windows can't blend an edge with what's
     behind the window, so outer edge pixels are either fully panel (in its own
@@ -2443,7 +2447,13 @@ def panel_image(w, h, r, fill, outline, width, dash, behind, hard_edge=False):
         d.rounded_rectangle((0, 0, W - 1, H - 1), radius=R, fill=fill)
         half = lw / 2
         path = rounded_path(half, half, W - 1 - half, H - 1 - half, R - half, S)
-        for run in dash_runs(path, dash[0] * S, dash[1] * S):
+        # Stretch the pattern slightly so a whole number of dashes goes round:
+        # no odd-sized dash where the path starts, and marching dashes wrap
+        # round without a jump
+        on, off = dash[0] * S, dash[1] * S
+        length = sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(path, path[1:]))
+        fit = length / max(1, round(length / (on + off))) / (on + off)
+        for run in dash_runs(path, on * fit, off * fit, shift):
             d.line(run, fill=outline, width=lw, joint="curve")
     img = img.resize((w, h), Image.BOX)     # plain averaging: no dark overshoot at edges
     if hard_edge:
@@ -2467,15 +2477,16 @@ class RoundPanel(tk.Canvas):
         self.behind = behind        # colour outside the rounded corners
         self.hard_edge = hard_edge  # True in see-through windows (see panel_image)
         self.scale = scale
-        self.style = (CARD_BORDER, 1, None)
+        self.style = (CARD_BORDER, 1, None, 0.0)
         self._img = self._drawn = self._pending = None
         self.bind("<Configure>", lambda e: self._schedule())
 
     # The main window's status card uses this to show the status colour as its
-    # border (dashed while blinking statuses like Framing are on).
-    def set_style(self, color, width, dash=None):
-        """width in logical px; dash = (on, off) in logical px, or None for solid."""
-        self.style = (color, width, dash)
+    # border (dashed while Ready or Framing; Framing's dashes march).
+    def set_style(self, color, width, dash=None, shift=0.0):
+        """width in logical px; dash = (on, off) in logical px, or None for
+        solid; shift moves the dashes along (see dash_runs)."""
+        self.style = (color, width, dash, shift if dash else 0.0)
         self.redraw()
 
     def _schedule(self):
@@ -2498,32 +2509,33 @@ class RoundPanel(tk.Canvas):
         w, h = self.winfo_width(), self.winfo_height()
         if w < 8 or h < 8:
             return
-        color, width, dash = self.style
+        color, width, dash, shift = self.style
         s = self.scale
         r = h / 2 if self.radius is None else self.radius * s
         args = (w, h, r, pick(CARD), pick(color) if isinstance(color, tuple) else color,
                 width * s, (dash[0] * s, dash[1] * s) if dash else None, pick(self.behind),
-                self.hard_edge)
+                self.hard_edge, shift)
         if args == self._drawn:
             return
         self._drawn = args
         if IS_MAC and self.hard_edge:
-            self._draw_shape(*args[:7])
+            self._draw_shape(*args[:7], shift)
             return
-        self.configure(bg=args[-2])
+        self.configure(bg=args[-3])
         # Recently drawn looks are kept, so flipping Running <-> Ready is instant
+        # and Framing's marching dashes (10 steps, card and pill) are drawn once
         key = args + (id(self.tk),)         # images belong to one Tk instance
         img = (RoundPanel._cache.pop(key, None)
                or ImageTk.PhotoImage(panel_image(*args), master=self))
         RoundPanel._cache[key] = img
-        while len(RoundPanel._cache) > 16:
+        while len(RoundPanel._cache) > 40:
             RoundPanel._cache.pop(next(iter(RoundPanel._cache)))
         self._img = img
         self.delete("panel")
         self.create_image(0, 0, anchor="nw", image=self._img, tags="panel")
         self.tag_lower("panel")
 
-    def _draw_shape(self, w, h, r, fill, outline, width, dash):
+    def _draw_shape(self, w, h, r, fill, outline, width, dash, shift=0.0):
         """macOS, see-through window: a see-through canvas there draws shapes
         but not pictures, so the panel is a rounded polygon instead (macOS
         smooths its edges itself)."""
@@ -2531,9 +2543,10 @@ class RoundPanel(tk.Canvas):
         half = width / 2
         pts = rounded_path(half, half, w - half, h - half, max(0.0, r - half), 2)
         self.delete("panel")
+        dash = tuple(round(d) for d in dash) if dash else ""
         self.create_polygon([c for p in pts for c in p], fill=fill, outline=outline,
-                            width=width, dash=tuple(round(d) for d in dash) if dash else "",
-                            tags="panel")
+                            width=width, dash=dash, tags="panel",
+                            dashoffset=round((1 - shift) * sum(dash)) if dash else 0)
         self.tag_lower("panel")
 
 
@@ -2863,11 +2876,12 @@ class App:
         # task tools): any of them quits the whole app properly
         for win in (self.root, self.pill, self.pill_menu):
             win.protocol("WM_DELETE_WINDOW", self.quit)
-        # Two timers keep the UI alive: poll() (fast: detector messages, links,
-        # alerts) and tick() (once a second: clocks, timers). Both reschedule
-        # themselves with root.after().
+        # Three timers keep the UI alive: poll() (fast: detector messages, links,
+        # alerts), tick() (clocks, timers) and animate() (the orb and outline
+        # moving, 20 fps). All reschedule themselves with root.after().
         self.poll()
         self.tick()
+        self.animate()
         self._mark_reports_sent()           # reports switched on but never sent: start fresh
         self.root.after(5000, self.check_reports)
         self.root.after(15000, lambda: self.check_updates(auto=True))
@@ -3215,6 +3229,8 @@ class App:
         box = self.section(body, "Display", "display")
         self.switch_row(box, "blink", "Blink for Framing / Disconnected",
                         "Off keeps every state steady")
+        self.switch_row(box, "animate", "Animations",
+                        "Running glows softly; Framing's ring and outline move")
         self.switch_row(box, "topmost", "Always on top", None,
                         on_change=lambda: self.root.attributes("-topmost", self.s["topmost"]))
         self.chime_var = self.switch_row(box, "chime", "Chime when a job finishes", None)
@@ -4763,7 +4779,6 @@ class App:
             self.test_banner.pack(fill="x", padx=18, pady=(10, 0), before=self.card)
         else:
             self.test_banner.pack_forget()
-        self._outline_key = None        # restyle the outlines on the next render
 
     # ------------------------------------------------------------- relays
     def rebuild_relay_panel(self):
@@ -5309,11 +5324,80 @@ class App:
         self.render()
         self.root.after(200, self.tick)
 
-    def outline_style(self, pill):
-        """(colour, width, dash) for the main card or the pill's outline.
-        Test mode keeps its own look: orange round the pill, plain card."""
-        if self.test_mode:
-            return (AMBER, 2, None) if pill else (CARD_BORDER, 1, None)
+    # The moving parts redraw 20 times a second; a new status colour fades in
+    ANIM_MS = 50
+    FADE_S = 0.3
+
+    def animate(self):
+        """20 times a second, forever: redraw what moves (see paint_status).
+        Costs next to nothing when nothing moves."""
+        try:
+            self.paint_status(time.time())
+        except Exception:
+            logging.exception("animate failed")
+        self.root.after(self.ANIM_MS, self.animate)
+
+    def motion(self, now):
+        """(pulse, spin, march) for this moment, each in a few fixed steps so
+        drawings repeat (the outline pictures are cached):
+        pulse 0-1 makes Running's glow breathe (every 2.4 s), None otherwise;
+        spin is how far (degrees) the dashed ring round the Framing orb has
+        turned; march 0-1 walks Framing's outline dashes along. With
+        Animations off nothing moves: (None, 0, 0.0)."""
+        if not self.s["animate"]:
+            return None, 0, 0.0
+        frame = int(now * 1000 / self.ANIM_MS)
+        pulse = (round((0.5 - 0.5 * math.cos(now / 2.4 * 2 * math.pi)) * 12) / 12
+                 if self.state == "busy" else None)
+        if self.state != "framing":
+            return pulse, 0, 0.0
+        return pulse, frame * 3 % 45, frame % 10 / 10   # ring 60°/s, dashes 20 px/s
+
+    def shown_color(self, color, now):
+        """The status colour on screen: after a change it fades from the old
+        colour to the new one over FADE_S (in 6 steps)."""
+        if color != getattr(self, "_fade_to", None):
+            self._fade_from = getattr(self, "_fade_shown", color)
+            self._fade_to, self._fade_t0 = color, now
+        t = min(1.0, (now - self._fade_t0) / self.FADE_S) if self.s["animate"] else 1.0
+        self._fade_shown = blend(self._fade_from, color, round(t * 6) / 6)
+        return self._fade_shown
+
+    def paint_status(self, now):
+        """Draw what shows the status: the orb, the pill's dot and the outline
+        round the card and the pill. Called by render() and animate(); each
+        part is only redrawn when its look changed. Test mode looks exactly
+        like the real status (its banner says it's a test)."""
+        color, _, blinks = look(self.state)
+        color = self.shown_color(color, now)
+        on = not (blinks and self.s["blink"]) or int(now / 0.6) % 2 == 0
+        pulse, spin, march = self.motion(now)
+        mode = ctk.get_appearance_mode()
+        if mode != getattr(self, "_key_mode", None):     # theme changed (or System did)
+            self._key_mode = mode
+            for win in (self.pill, self.pill_menu):
+                set_window_key(win)
+        outline_key = (self.outline_style(), march, mode)
+        if outline_key != getattr(self, "_outline_key", None):
+            self._outline_key = outline_key
+            self.card.set_style(*outline_key[0], shift=march)
+            self.pill_frame.set_style(*outline_key[0], shift=march)
+        if self.root.state() != "withdrawn":
+            ring = spin if self.state == "framing" else None
+            key = (color, on, mode, pulse, ring)
+            if key != self._orb_key:
+                self.draw_orb(color, on, pulse, ring)
+                self._orb_key = key
+        if self.pill.state() != "withdrawn":
+            key = (color, on, mode, pulse)
+            if key != self._pill_key:
+                self.draw_pill(color, on, pulse)
+                self._pill_key = key
+
+    def outline_style(self):
+        """(colour, width, dash) for the outline of the main card and the pill:
+        the status colour, dashed while Ready or Framing (Framing's dashes
+        march, see paint_status), plain grey when there's no status."""
         if self.state in ("busy", "paused"):
             return (look(self.state)[0], 2, None)
         if self.state in ("ready", "framing"):
@@ -5332,26 +5416,10 @@ class App:
             self.monitor(now)               # alerts, sensors, maintenance, dashboard
         except Exception:
             logging.exception("monitor failed")
-        color, title, blinks = look(self.state)
-        on = True
-        if blinks and self.s["blink"]:
-            on = int(time.time() / 0.6) % 2 == 0
-        mode = ctk.get_appearance_mode()
-        if mode != getattr(self, "_key_mode", None):     # theme changed (or System did)
-            self._key_mode = mode
-            for win in (self.pill, self.pill_menu):
-                set_window_key(win)
-        outline_key = (self.state, self.test_mode, mode)
-        if outline_key != getattr(self, "_outline_key", None):
-            self._outline_key = outline_key
-            self.card.set_style(*self.outline_style(pill=False))
-            self.pill_frame.set_style(*self.outline_style(pill=True))
+        title = look(self.state)[1]
+        self.paint_status(now)
 
         if self.root.state() != "withdrawn":
-            key = (color, on, mode, self.state)
-            if key != self._orb_key:
-                self.draw_orb(color, on)
-                self._orb_key = key
             self.title_lbl.configure(text=title)
             self.sub_lbl.configure(text=self.subtitle())
             self.check_lbl.configure(
@@ -5381,10 +5449,6 @@ class App:
                     self.update_diag()
 
         if self.pill.state() != "withdrawn":
-            key = (color, on, mode, self.state)
-            if key != self._pill_key:
-                self.draw_pill(color, on)
-                self._pill_key = key
             # Capitals: no descenders, so every word sits centred beside the dot
             self.pill_title.configure(text=title.upper())
             t = ""
@@ -5420,10 +5484,12 @@ class App:
         self.diag.insert("1.0", text)
         self.diag.configure(state="disabled")
 
-    def draw_orb(self, color, on):
+    def draw_orb(self, color, on, pulse=None, ring=None):
         """Draw the big status orb: a glow of 12 rings fading out from the core,
         the solid core, and a slightly lighter centre for depth. on=False
-        draws it dimmed (the "off" phase of blinking)."""
+        draws it dimmed (the "off" phase of blinking). pulse (0-1, Running)
+        makes the glow fainter or brighter; ring (degrees turned, Framing)
+        adds a dashed ring round the core, like a frame being traced."""
         c = self.orb
         card = pick(CARD)
         c.configure(bg=card)
@@ -5432,26 +5498,34 @@ class App:
         cx = cy = size / 2
         R = size * 0.27
         rings = 12
+        glow = 1.0 if pulse is None else 0.7 + 0.6 * pulse
         for i in range(rings, 0, -1):
             r = R + i * (size * 0.018)
-            strength = (0.30 if on else 0.05) * (1 - i / (rings + 1)) ** 1.8
+            strength = min(1.0, (0.30 if on else 0.05) * glow * (1 - i / (rings + 1)) ** 1.8)
             c.create_oval(cx - r, cy - r, cx + r, cy + r, fill=blend(card, color, strength),
                           outline="")
+        if ring is not None:            # 8 dashes, turning clockwise
+            rr = R * 1.2
+            for n in range(8):
+                c.create_arc(cx - rr, cy - rr, cx + rr, cy + rr, start=n * 45 - ring,
+                             extent=26, style="arc", width=max(2, size * 0.014),
+                             outline=color if on else blend(card, color, 0.3))
         core = color if on else blend(card, color, 0.22)
         c.create_oval(cx - R, cy - R, cx + R, cy + R, fill=core, outline="")
         hi = R * 0.78
         c.create_oval(cx - hi, cy - hi, cx + hi, cy + hi,
                       fill=blend(core, "#FFFFFF", 0.10 if on else 0.03), outline="")
 
-    def draw_pill(self, color, on):
-        """Draw the pill's dot: a faint halo and a solid centre."""
+    def draw_pill(self, color, on, pulse=None):
+        """Draw the pill's dot: a faint halo (breathing with pulse while
+        Running, see draw_orb) and a solid centre."""
         c = self.pill_dot
         card = pick(CARD)
         c.configure(bg=card)
         c.delete("all")
         d = self.pill_dot_size
-        c.create_oval(1, 1, d - 1, d - 1, fill=blend(card, color, 0.25 if on else 0.05),
-                      outline="")
+        halo = (0.25 if on else 0.05) * (1.0 if pulse is None else 0.6 + 0.8 * pulse)
+        c.create_oval(1, 1, d - 1, d - 1, fill=blend(card, color, halo), outline="")
         p = d * 0.2
         c.create_oval(p, p, d - p, d - p, fill=color if on else blend(card, color, 0.22),
                       outline="")
