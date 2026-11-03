@@ -107,16 +107,27 @@ def _reset(ser):
     ser.reset_input_buffer()
 
 
+def _open(port, baud):
+    """Open the port. Windows can refuse a port ("Access is denied") for a
+    moment after another program (or Beacon's own link, or the previous
+    speed tried) closed it, so keep trying for 3 seconds."""
+    import serial               # pyserial is optional in Beacon; only needed here
+    end = time.monotonic() + 3
+    while True:
+        try:
+            return serial.Serial(port, baud, timeout=0.05, write_timeout=2)
+        except (serial.SerialException, OSError) as e:
+            if time.monotonic() > end:
+                raise FlashError(f"Can't open {port}. Close the Arduino IDE's Serial Monitor "
+                                 f"and any other program using it. ({e})") from e
+            time.sleep(0.25)
+
+
 def _connect(port):
     """Open the port at whichever speed the bootloader answers. Returns an
     open _Board."""
-    import serial               # pyserial is optional in Beacon; only needed here
     for baud in BAUDS:
-        try:
-            ser = serial.Serial(port, baud, timeout=0.05, write_timeout=2)
-        except (serial.SerialException, OSError) as e:
-            raise FlashError(f"Can't open {port}. Close the Arduino IDE's Serial Monitor "
-                             f"and any other program using it. ({e})") from e
+        ser = _open(port, baud)
         _reset(ser)
         board = _Board(ser)
         if board.sync():

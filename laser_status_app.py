@@ -1630,6 +1630,10 @@ class ArduinoLink(LinkBase):
         self._open_port = None
         self._buf = b""
         self.hold = False           # Install on Arduino is using the port: stay off it
+        # Set once the port is closed for `hold`. Windows lets only one program
+        # open a port, so the upload must wait for this, not just for _ser to
+        # be None (the thread may be about to open it again).
+        self.held = threading.Event()
         self._opened_at = 0.0
 
     def _read_inputs(self):
@@ -1676,10 +1680,12 @@ class ArduinoLink(LinkBase):
                 continue
             if self.hold:
                 self._close()
+                self.held.set()
                 self.status = "Installing Beacon's program on the Arduino…"
                 self.wake.wait(0.2)
                 self.wake.clear()
                 continue
+            self.held.clear()
             if not self.enabled:
                 self._close(send_off=True)
                 self.status = "Off"
@@ -4678,11 +4684,10 @@ class App:
 
         def work():
             link = self.arduino
+            link.held.clear()
             link.hold = True                    # the link closes the port...
             link.wake.set()
-            end = time.time() + 5
-            while link._ser is not None and time.time() < end:
-                time.sleep(0.1)                 # ...within half a second
+            link.held.wait(5)                   # ...within a couple of seconds
             try:
                 size = flasher.upload(port, hex_path, progress)
                 result = (f"✓ Installed on {port} ({size // 1024} KB). Turn on Send status "
