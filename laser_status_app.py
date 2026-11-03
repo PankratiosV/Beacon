@@ -76,6 +76,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 from datetime import date, datetime, timedelta
 from tkinter import filedialog, messagebox, ttk
 
@@ -2959,18 +2960,24 @@ class App:
         buttons, and the footer (last check, Arduino connection)."""
         p = self.status_page = ctk.CTkFrame(self.root, fg_color="transparent")
 
-        head = ctk.CTkFrame(p, fg_color="transparent")
+        head = self.head = ctk.CTkFrame(p, fg_color="transparent")
         head.pack(fill="x", padx=18, pady=(16, 0))
-        ctk.CTkLabel(head, text=HEADER_TEXT, font=self.font(15, "bold"),
-                     text_color=TEXT).pack(side="left")
         self.icon_button(head, "\u2699", lambda: self.show_page("settings")).pack(side="right")
         self.icon_button(head, "?", lambda: self.show_page("help")).pack(side="right", padx=(0, 2))
         self.icon_button(head, "\u2198", self.enter_compact).pack(side="right", padx=(0, 2))
         stats_img = ctk.CTkImage(light_image=bars_icon(MUTED[0]), dark_image=bars_icon(MUTED[1]),
                                  size=(18, 18))
-        ctk.CTkButton(head, text="", image=stats_img, width=34, height=34, corner_radius=10,
-                      fg_color="transparent", hover_color=CARD_BORDER,
-                      command=lambda: self.show_page("stats")).pack(side="right", padx=(0, 2))
+        self.head_first_btn = ctk.CTkButton(
+            head, text="", image=stats_img, width=34, height=34, corner_radius=10,
+            fg_color="transparent", hover_color=CARD_BORDER,
+            command=lambda: self.show_page("stats"))
+        self.head_first_btn.pack(side="right", padx=(0, 2))
+        # Packed after the buttons so they always keep their room. During a job
+        # it shows the job's file name, fitted to the space left (fit_header).
+        self.head_lbl = ctk.CTkLabel(head, text=HEADER_TEXT, font=self.font(15, "bold"),
+                                     text_color=TEXT, anchor="w")
+        self.head_lbl.pack(side="left", fill="x", expand=True)
+        head.bind("<Configure>", lambda e: self.fit_header(), add="+")
 
         self.test_banner = ctk.CTkButton(p, text="TEST MODE  \u00b7  click to go back to live",
                                          height=26, corner_radius=10, fg_color=AMBER,
@@ -3000,10 +3007,6 @@ class App:
         self.title_lbl = ctk.CTkLabel(card, text="Starting", font=self.font(34, "bold"),
                                       text_color=TEXT, bg_color=CARD)
         self.title_lbl.pack()
-        # The running job's file name, between the status and the timer line;
-        # packed only during a job (see show_job_name)
-        self.job_lbl = ctk.CTkLabel(card, text="", font=self.font(15, "bold"), text_color=TEXT,
-                                    height=22, wraplength=290, bg_color=CARD)
         self.sub_lbl = ctk.CTkLabel(card, text="Looking for LightBurn", font=self.font(14),
                                     text_color=MUTED, wraplength=290, bg_color=CARD)
         self.sub_lbl.pack(pady=(2, 18))
@@ -5374,20 +5377,38 @@ class App:
             return "Simulated: LightBurn's status can't be seen"
         return (self.last_msg.get("note") or "Can't see LightBurn's status")
 
-    def show_job_name(self):
-        """Show the running or paused job's file name under the status (from
-        LightBurn's API, or its title bar on versions without one); hide the
-        line between jobs or when the file has no name yet."""
+    HEADER_SIZES = (15, 14, 13, 12)     # header text sizes tried, largest first
+
+    def fit_header(self):
+        """The heading at the top of the Home page: the running or paused job's
+        file name (from LightBurn's API, or its title bar on versions without
+        one), otherwise HEADER_TEXT. It must fit between the left edge and
+        the buttons: the text gets smaller, down to the last of HEADER_SIZES,
+        and only then is cut short with "…". Runs on every render and when
+        the header is resized; does nothing if neither changed."""
         name = self.job_name if self.state in ("busy", "paused") else ""
-        if len(name) > 40:
-            name = name[:39] + "…"
-        if name:
-            if self.job_lbl.cget("text") != name:
-                self.job_lbl.configure(text=name)
-            if not self.job_lbl.winfo_manager():
-                self.job_lbl.pack(before=self.sub_lbl, pady=(0, 0))
-        elif self.job_lbl.winfo_manager():
-            self.job_lbl.pack_forget()
+        text = (name + (" · DEV" if DEV else "")) if name else HEADER_TEXT
+        lbl = self.head_lbl
+        room = self.head_first_btn.winfo_x() - lbl.winfo_x() - 10   # gap before the buttons
+        key = (text, room)
+        if room <= 0 or key == getattr(self, "_head_key", None):
+            return
+        self._head_key = key
+        scaling = ctk.ScalingTracker.get_widget_scaling(lbl)
+        fonts = self.__dict__.setdefault("_head_fonts", {})     # size -> (CTkFont, measurer)
+        for size in self.HEADER_SIZES:
+            if (size, scaling) not in fonts:
+                f = self.font(size, "bold")
+                fonts[size, scaling] = f, tkfont.Font(font=f.create_scaled_tuple(scaling))
+            font, metric = fonts[size, scaling]
+            measure = metric.measure
+            if measure(text) <= room:
+                break
+        else:                           # still too wide at the smallest size: cut it
+            while len(text) > 1 and measure(text.rstrip() + "…") > room:
+                text = text[:-1]
+            text = text.rstrip() + "…"
+        lbl.configure(text=text, font=font)
 
     def tick(self):
         """Redraw five times a second (blinking, timers), forever."""
@@ -5491,7 +5512,7 @@ class App:
 
         if self.root.state() != "withdrawn":
             self.title_lbl.configure(text=title)
-            self.show_job_name()
+            self.fit_header()
             self.sub_lbl.configure(text=self.subtitle())
             self.check_lbl.configure(
                 text="Run time today" + " " + fmt_human(self.runlog.run_on(date.today(), now))
