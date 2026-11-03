@@ -6,21 +6,24 @@ approves within 30 s it returns a secret. Every other call sends
 "Authorization: Bearer <token>", where the token is the hex HMAC-SHA256 of
 the current Unix minute (as a decimal string) keyed with that secret.
 
-Beacon only asks for the "state" capability (job state, progress, connection).
-It deliberately doesn't ask for "project", which would also give access to
-the camera overlay image.
+Beacon asks for "state" (job state, progress, connection) and "project", for
+the open file's name only (GET /api/project), shown while a job runs.
+"project" would also allow reading the camera overlay image; Beacon never
+asks for it. A pairing made before Beacon asked for "project" still reads
+the state; the file name then comes from LightBurn's title bar instead.
 Docs: https://github.com/LightBurnSoftware/LightBurn-REST"""
 
 import hashlib
 import hmac
 import json
+import re
 import time
 import urllib.error
 import urllib.request
 
 HOST = "127.0.0.1"
 PORT = 19520
-CAPABILITIES = ["state"]
+CAPABILITIES = ["state", "project"]
 PAIR_TIMEOUT = 35            # LightBurn's consent pop-up waits 30 s
 
 # Never send these local calls through a system proxy
@@ -120,3 +123,19 @@ def snapshot(secret, timeout=2.0):
     {"job": {"state": "idle"|"running"|"paused", "progress"?: 0-100},
      "connection": {"connected": bool, "device_name": str, ...}, ...}"""
     return get("/api/events/poll", secret, timeout=timeout)
+
+
+def project_name(secret, timeout=2.0):
+    """The open project's name without folder or extension ("Coasters" for
+    "C:\\Jobs\\Coasters.lbrn2"), or "" when it has none yet (GET
+    /api/project). Raises ApiError; 401/403 here usually means the pairing
+    was made without the "project" capability."""
+    try:
+        got = _request("GET", "/api/project", secret=secret, timeout=timeout)
+    except ApiError as e:
+        if e.code in (401, 403):
+            raise ApiError("Beacon's key can't read the file name: press Connect again in "
+                           "Settings to allow it.", e.code) from e
+        raise
+    name = re.split(r"[\\/]", str(got.get("filename") or ""))[-1]
+    return re.sub(r"\.lbrn2?$", "", name, flags=re.I).strip()

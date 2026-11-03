@@ -1279,6 +1279,9 @@ class ApiDetector(Detector):
         self.trusted = trusted          # {device name: True}
         self.on_trust = on_trust        # called (from this thread) when a device is learned
         self.api_progress = None
+        self.api_file = ""              # the project's name from the API, during a job
+        self.project_ok = None          # False: this pairing may not read the project
+        self._project_at = 0.0
         self._idle_connected = 0
         self._device = None
         self._run_start = None          # when the current running/paused phase began
@@ -1422,7 +1425,34 @@ class ApiDetector(Detector):
         else:
             return None, f"LightBurn reported an unknown job state: {state}", lines, "api"
         self.api_progress = p if status in ("busy", "paused") else None
+        self.read_project(state)
+        if self.api_file:
+            self.file_name = self.api_file
+            lines.append(f"file (API): {self.api_file}")
         return status, "", lines, "api"
+
+    PROJECT_EVERY = 5.0         # seconds between file name requests during a job
+
+    def read_project(self, state):
+        """During a job (running or paused), ask the API for the project's
+        name: at once when the job starts, then every PROJECT_EVERY seconds.
+        Between jobs it's forgotten, so the title bar's name (read every
+        check) is used. A pairing without the "project" capability is asked
+        once and then left alone (project_ok False) until Beacon reconnects."""
+        if state not in ("running", "paused"):
+            self.api_file, self._project_at = "", 0.0
+            return
+        now = time.time()
+        if self.project_ok is False or now - self._project_at < self.PROJECT_EVERY:
+            return
+        self._project_at = now
+        try:
+            self.api_file = lbapi.project_name(self.secret)
+            self.project_ok = True
+        except lbapi.ApiError as e:
+            if e.code in (401, 403):
+                self.project_ok = False
+                logging.info("API file name: %s", e)
 
 
 class HybridDetector(Detector):
@@ -1489,7 +1519,7 @@ class HybridDetector(Detector):
             sc.debounce(s_status)
             self._mark("screen", s_status, now)
             self._screen_read = (s_note, s_lines, s_mode)
-        self.file_name, self.crop = sc.file_name, sc.crop
+        self.crop = sc.crop
         # API (at most 5 a second)
         api = self.api
         if now - self._api_at >= ApiDetector.MIN_INTERVAL:
@@ -1501,6 +1531,9 @@ class HybridDetector(Detector):
                 self._mark("api", a[0], now)
                 self._api_read = a
         self.api_progress = api.api_progress if api.shown in ("busy", "paused") else None
+        # The file name: the API's during a job, else the title bar's (the API
+        # reader also finds a minimised LightBurn's title)
+        self.file_name = api.api_file or sc.file_name or api.file_name
 
         if sc.shown is not None:        # the screen can be read: show it
             status, self.source = sc.shown, "screen"
@@ -2793,6 +2826,7 @@ class App:
         # monitoring / alerts
         self.progress = None                # job % from LightBurn's progress bar
         self.file_name = ""                 # open LightBurn file
+        self.job_name = ""                  # the file the current / last job came from
         self.job_alerts = set()             # alerts already sent for the current job
         self.idle_since = None              # when the laser last stopped after a job
         self.free_sent = True
@@ -2961,6 +2995,10 @@ class App:
         self.title_lbl = ctk.CTkLabel(card, text="Starting", font=self.font(34, "bold"),
                                       text_color=TEXT, bg_color=CARD)
         self.title_lbl.pack()
+        # The running job's file name, between the status and the timer line;
+        # packed only during a job (see show_job_name)
+        self.job_lbl = ctk.CTkLabel(card, text="", font=self.font(15, "bold"), text_color=TEXT,
+                                    height=22, wraplength=290, bg_color=CARD)
         self.sub_lbl = ctk.CTkLabel(card, text="Looking for LightBurn", font=self.font(14),
                                     text_color=MUTED, wraplength=290, bg_color=CARD)
         self.sub_lbl.pack(pady=(2, 18))
@@ -4459,7 +4497,7 @@ class App:
 
     def _job_label(self):
         """A second line naming the file and customer for job messages, or ""."""
-        bits = [b for b in (self.file_name, self.s["client"]) if b]
+        bits = [b for b in (self.job_name or self.file_name, self.s["client"]) if b]
         return ("\n" + " · ".join(bits)) if bits else ""
 
     def _notify_change(self, old, new):
@@ -4641,6 +4679,12 @@ class App:
                 text, color = msg.get("note") or "Waiting for LightBurn…", AMBER
             else:
                 text, color = "Waiting for LightBurn…", MUTED
+        # Paired before Beacon asked to read the project: the job's name comes
+        # from the title bar until the user connects again
+        api = (self.detector.api if isinstance(self.detector, HybridDetector) else
+               self.detector if isinstance(self.detector, ApiDetector) else None)
+        if paired and api is not None and api.project_ok is False:
+            text += "\nPress Connect again to let Beacon read the job's file name."
         if self.api_status.cget("text") != text:
             self.api_status.configure(text=text, text_color=color)
 
@@ -5111,6 +5155,8 @@ class App:
                         self.file_name = msg["file"]
                     self.progress = msg.get("progress")
                     self.set_state(msg["shown"], msg.get("since"))
+                    if self.state in ("busy", "paused") and not self.job_name:
+                        self.job_name = self.file_name      # the name came a moment late
         except queue.Empty:
             pass
         self.settle_job_end()
@@ -5222,6 +5268,9 @@ class App:
         if new == "busy" and old != "paused":
             self.job_start = now
         job = ("busy", "paused")
+        if new in job and old not in job:
+            # Kept for the whole job: opening another file meanwhile doesn't rename it
+            self.job_name = self.file_name
         if old in job and new not in job:
             if self.job_start:
                 self.last_job = now - self.job_start
@@ -5318,6 +5367,21 @@ class App:
         if self.test_mode:
             return "Simulated: LightBurn's status can't be seen"
         return (self.last_msg.get("note") or "Can't see LightBurn's status")
+
+    def show_job_name(self):
+        """Show the running or paused job's file name under the status (from
+        LightBurn's API, or its title bar on versions without one); hide the
+        line between jobs or when the file has no name yet."""
+        name = self.job_name if self.state in ("busy", "paused") else ""
+        if len(name) > 40:
+            name = name[:39] + "…"
+        if name:
+            if self.job_lbl.cget("text") != name:
+                self.job_lbl.configure(text=name)
+            if not self.job_lbl.winfo_manager():
+                self.job_lbl.pack(before=self.sub_lbl, pady=(0, 0))
+        elif self.job_lbl.winfo_manager():
+            self.job_lbl.pack_forget()
 
     def tick(self):
         """Redraw five times a second (blinking, timers), forever."""
@@ -5421,6 +5485,7 @@ class App:
 
         if self.root.state() != "withdrawn":
             self.title_lbl.configure(text=title)
+            self.show_job_name()
             self.sub_lbl.configure(text=self.subtitle())
             self.check_lbl.configure(
                 text="Run time today" + " " + fmt_human(self.runlog.run_on(date.today(), now))
