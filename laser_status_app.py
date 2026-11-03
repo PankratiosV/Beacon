@@ -1279,9 +1279,11 @@ class ApiDetector(Detector):
         self.trusted = trusted          # {device name: True}
         self.on_trust = on_trust        # called (from this thread) when a device is learned
         self.api_progress = None
-        self.api_file = ""              # the project's name from the API, during a job
+        self.api_file = ""              # the project's name from the API
         self.project_ok = None          # False: this pairing may not read the project
         self._project_at = 0.0
+        self._project_in_job = False    # the last reading was running / paused
+        self._project_logged = False    # a failed name request was logged
         self._idle_connected = 0
         self._device = None
         self._run_start = None          # when the current running/paused phase began
@@ -1431,19 +1433,20 @@ class ApiDetector(Detector):
             lines.append(f"file (API): {self.api_file}")
         return status, "", lines, "api"
 
-    PROJECT_EVERY = 5.0         # seconds between file name requests during a job
+    PROJECT_EVERY = 5.0         # seconds between file name requests
 
     def read_project(self, state):
-        """During a job (running or paused), ask the API for the project's
-        name: at once when the job starts, then every PROJECT_EVERY seconds.
-        Between jobs it's forgotten, so the title bar's name (read every
-        check) is used. A pairing without the "project" capability is asked
-        once and then left alone (project_ok False) until Beacon reconnects."""
-        if state not in ("running", "paused"):
-            self.api_file, self._project_at = "", 0.0
-            return
+        """Ask the API for the project's name every PROJECT_EVERY seconds, and
+        at once when a job starts (so it's the job's file, not the one open a
+        few seconds earlier). Asked between jobs too, so test mode shows it.
+        A pairing without the "project" capability is asked once and then
+        left alone (project_ok False) until Beacon reconnects."""
         now = time.time()
-        if self.project_ok is False or now - self._project_at < self.PROJECT_EVERY:
+        in_job = state in ("running", "paused")
+        starting = in_job and not self._project_in_job
+        self._project_in_job = in_job
+        if self.project_ok is False or (not starting
+                                        and now - self._project_at < self.PROJECT_EVERY):
             return
         self._project_at = now
         try:
@@ -1452,7 +1455,9 @@ class ApiDetector(Detector):
         except lbapi.ApiError as e:
             if e.code in (401, 403):
                 self.project_ok = False
-                logging.info("API file name: %s", e)
+            if not self._project_logged:                        # once, for diagnosing
+                self._project_logged = True
+                logging.info("API file name: %s (HTTP %s)", e, e.code)
 
 
 class HybridDetector(Detector):
@@ -1531,8 +1536,8 @@ class HybridDetector(Detector):
                 self._mark("api", a[0], now)
                 self._api_read = a
         self.api_progress = api.api_progress if api.shown in ("busy", "paused") else None
-        # The file name: the API's during a job, else the title bar's (the API
-        # reader also finds a minimised LightBurn's title)
+        # The file name: the API's when it gives one, else the title bar's (the
+        # API reader also finds a minimised LightBurn's title)
         self.file_name = api.api_file or sc.file_name or api.file_name
 
         if sc.shown is not None:        # the screen can be read: show it
@@ -5149,10 +5154,10 @@ class App:
                     continue
                 self.last_msg = msg
                 self.last_check = time.time()
+                if msg.get("file"):     # the open file is real even in test mode
+                    self.file_name = msg["file"]
                 if not self.test_mode:
                     self.checklog.record(msg)
-                    if msg.get("file"):
-                        self.file_name = msg["file"]
                     self.progress = msg.get("progress")
                     self.set_state(msg["shown"], msg.get("since"))
                     if self.state in ("busy", "paused") and not self.job_name:
@@ -5269,8 +5274,9 @@ class App:
             self.job_start = now
         job = ("busy", "paused")
         if new in job and old not in job:
-            # Kept for the whole job: opening another file meanwhile doesn't rename it
-            self.job_name = self.file_name
+            # Kept for the whole job: opening another file meanwhile doesn't rename
+            # it. A test job without a saved file open still shows the line.
+            self.job_name = self.file_name or ("Test job" if self.test_mode else "")
         if old in job and new not in job:
             if self.job_start:
                 self.last_job = now - self.job_start
