@@ -2083,6 +2083,10 @@ CARD_BORDER = ("#E5E7EB", "#232733")
 TEXT = ("#0F172A", "#F1F5F9")
 MUTED = ("#6B7280", "#8B93A3")
 ACCENT = ("#2563EB", "#3B82F6")
+# Scrollbars of the long pages: a quiet thumb in the theme's colours, brighter
+# on hover (CustomTkinter's default mid-grey stood out against the cards)
+SCROLL_STYLE = {"scrollbar_button_color": ("#D1D5DB", "#2E3340"),
+                "scrollbar_button_hover_color": ("#9CA3AF", "#4B5263")}
 
 # Status colours, the same in both themes.
 RED = "#EF4444"
@@ -2155,6 +2159,28 @@ def background_of(widget):
             continue
         return as_pair(widget.cget("bg"))
     return BG
+
+
+class Segmented(ctk.CTkSegmentedButton):
+    """CTkSegmentedButton without a thin grey line after its last button. At
+    display scalings like 125% CustomTkinter draws each button a pixel or two
+    narrower than its space, and that strip shows the control's grey: hidden
+    between buttons, but a stray line after the last one. That button's strip
+    gets the colour behind the control instead."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._hide_end_strip()      # after __init__: its last step resets the buttons' colour
+
+    def _create_button_grid(self):
+        super()._create_button_grid()       # also runs when the values change
+        if hasattr(self, "_variable_callback_blocked"):      # __init__ has finished
+            self._hide_end_strip()
+
+    def _hide_end_strip(self):
+        if self._value_list:
+            self._buttons_dict[self._value_list[-1]].configure(
+                bg_color=background_of(self.master))
 
 
 class PlainFrame(tk.Frame):
@@ -3228,7 +3254,7 @@ class App:
                       command=lambda: self.show_page(back)).pack(side="left")
         ctk.CTkLabel(head, text=title, font=self.font(15, "bold"),
                      text_color=TEXT).pack(side="right", padx=4)
-        body = ctk.CTkScrollableFrame(p, fg_color="transparent")
+        body = ctk.CTkScrollableFrame(p, **SCROLL_STYLE, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=12, pady=(4, 12))
         return p, body
 
@@ -3262,7 +3288,7 @@ class App:
                       font=self.font(13, "bold"),
                       command=lambda: self.show_page("status")).pack(side="left")
         PlainLabel(head, text="Settings", font=self.font(15, "bold")).pack(side="right", padx=4)
-        body = ctk.CTkScrollableFrame(p, fg_color="transparent")
+        body = ctk.CTkScrollableFrame(p, **SCROLL_STYLE, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=12, pady=(4, 12))
         self.settings_body = body
         self.settings_sections, self.section_titles, self.section_arrows = {}, {}, {}
@@ -3299,7 +3325,7 @@ class App:
         self.show_chime_name()
 
         r = self.row(box, "Appearance")
-        seg = ctk.CTkSegmentedButton(r, values=["System", "Light", "Dark"],
+        seg = Segmented(r, values=["System", "Light", "Dark"],
                                      command=self.set_appearance, font=self.font(12))
         seg.set(self.s["appearance"])
         seg.pack(side="right")
@@ -3308,7 +3334,7 @@ class App:
         # --- Detection: screen reading or LightBurn's API
         box = self.section(body, "Detection", "detection")
         self.row(box, "Read LightBurn's status from", None)
-        self.detect_seg = ctk.CTkSegmentedButton(box, values=list(self.DETECT_MODES.values()),
+        self.detect_seg = Segmented(box, values=list(self.DETECT_MODES.values()),
                                                  command=self.set_detect_mode,
                                                  font=self.font(12))
         self.detect_seg.set(self.DETECT_MODES[self.s["detect_mode"]])
@@ -3322,7 +3348,7 @@ class App:
         self.row(box, "Check every", "Faster reacts quicker but uses more CPU. "
                                      "LightBurn's API is asked at most 5 times a second.")
         labels = {0.1: "0.1 s", 0.25: "0.25 s", 0.5: "0.5 s", 1.0: "1 s", 2.0: "2 s"}
-        seg2 = ctk.CTkSegmentedButton(box, values=list(labels.values()),
+        seg2 = Segmented(box, values=list(labels.values()),
                                       command=self.set_interval, font=self.font(12))
         seg2.set(labels.get(float(self.s["interval"]), "1 s"))
         seg2.pack(fill="x", padx=14, pady=(0, 8))
@@ -3653,7 +3679,7 @@ class App:
         ctk.CTkLabel(head, text="Relay buttons", font=self.font(15, "bold"),
                      text_color=TEXT).pack(side="right", padx=4)
 
-        self.relays_body = ctk.CTkScrollableFrame(p, fg_color="transparent")
+        self.relays_body = ctk.CTkScrollableFrame(p, **SCROLL_STYLE, fg_color="transparent")
         self.relays_body.pack(fill="both", expand=True, padx=12, pady=(4, 12))
         self.relay_name_vars = {}
         self.rebuild_relays_page()
@@ -6484,7 +6510,7 @@ class App:
         self.wiz_next.pack(side="right")
         self.wiz_dots = ctk.CTkLabel(nav, text="", text_color=MUTED, font=self.font(12))
         self.wiz_dots.pack(side="top")
-        self.wiz_body = ctk.CTkScrollableFrame(p, fg_color="transparent")
+        self.wiz_body = ctk.CTkScrollableFrame(p, **SCROLL_STYLE, fg_color="transparent")
         self.wiz_body.pack(fill="both", expand=True, padx=10)
         self.wiz_step = 0
         self.wiz_steps = [self._wiz_welcome, self._wiz_lightburn, self._wiz_stacklight,
@@ -6591,7 +6617,7 @@ class App:
         self._wiz_text("Beacon reads both and takes whichever notices a change first, for the "
                        "most accurate times; when LightBurn is minimised it carries on with the "
                        "API alone.")
-        seg = ctk.CTkSegmentedButton(self.wiz_body, values=list(self.DETECT_MODES.values()),
+        seg = Segmented(self.wiz_body, values=list(self.DETECT_MODES.values()),
                                      command=self._wiz_set_mode, font=self.font(12))
         seg.set(self.DETECT_MODES[self.s["detect_mode"]])
         seg.pack(fill="x", padx=8, pady=(8, 4))
@@ -7288,7 +7314,7 @@ class StatsView:
     def build_costs(self, tab):
         """Costs tab: the cost inputs on the left (saved as you type), cost
         cards and a cost chart on the right."""
-        left = ctk.CTkScrollableFrame(tab, width=250, fg_color=CARD, corner_radius=14,
+        left = ctk.CTkScrollableFrame(tab, **SCROLL_STYLE, width=250, fg_color=CARD, corner_radius=14,
                                       border_width=1, border_color=CARD_BORDER)
         left.pack(side="left", fill="y", padx=(5, 5), pady=5)
         ctk.CTkLabel(left, text="Your machine costs", font=self.app.font(14, "bold"),
@@ -7952,7 +7978,7 @@ class StatsView:
         self.maint_total = self.label(head, "", 12, MUTED)
         self.maint_total.pack(side="left", padx=4)
         self.ghost_btn(head, "Add task", self.add_maint, 90).pack(side="right")
-        self.maint_box = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        self.maint_box = ctk.CTkScrollableFrame(tab, **SCROLL_STYLE, fg_color="transparent")
         self.maint_box.pack(fill="both", expand=True)
         self.label(tab, "You get a message when a task is due (Settings › Notifications). "
                         "Press Done after doing it to start counting again.", 11, MUTED).pack(
