@@ -11,7 +11,7 @@
 ; install folder, {autoprograms} the Start menu, {userappdata} %APPDATA%.
 
 #define MyAppName      "Beacon"
-#define MyAppVersion   "2.1.1"
+#define MyAppVersion   "2.1.2"
 #define MyAppPublisher "Beacon"
 #define MyAppExeName   "Beacon.exe"
 ; Shortcut name, matching the window title (RELEASE_LABEL in laser_status_app.py)
