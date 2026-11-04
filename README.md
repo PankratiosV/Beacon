@@ -1,5 +1,7 @@
 # Beacon — Live Laser Status App for LightBurn - BETA
 
+🌐 **Website: [beaconlaserapp.com](https://beaconlaserapp.com)** — screenshots, features, hardware kit and FAQ.
+
 ## ⬇️ Download
 
 <!-- The Windows link points at the newest release: when the version changes, update the
