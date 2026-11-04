@@ -5476,7 +5476,9 @@ class App:
         if color != getattr(self, "_fade_to", None):
             self._fade_from = getattr(self, "_fade_shown", color)
             self._fade_to, self._fade_t0 = color, now
-        t = min(1.0, (now - self._fade_t0) / self.FADE_S) if self.s["animate"] else 1.0
+        # Clamped: a frame drawn with a slightly older clock than the fade start
+        # would otherwise mix past the old colour into an invalid one
+        t = min(1.0, max(0.0, (now - self._fade_t0) / self.FADE_S)) if self.s["animate"] else 1.0
         self._fade_shown = blend(self._fade_from, color, round(t * 6) / 6)
         return self._fade_shown
 
