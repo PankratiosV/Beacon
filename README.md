@@ -2,12 +2,14 @@
 
 ## ⬇️ Download
 
-<!-- These links always point at the newest release. When the version changes, update the
-     file names here to match what's attached to it. -->
+<!-- The Windows link points at the newest release: when the version changes, update the
+     file name to match what's attached to it. The Mac links point at the v2.1.0 release,
+     the newest one with Mac files; switch them back to releases/latest/download/... (with
+     the new file names) once a release carries a new .pkg and .dmg. -->
 | | |
 |---|---|
-| **Windows 10/11** | **[Download Beacon for Windows](https://github.com/PankratiosV/Beacon/releases/latest/download/Beacon-Setup-2.1.0.exe)** (.exe installer) |
-| **Mac** (Apple Silicon or Intel, macOS 12.3+) | **[Download Beacon for Mac](https://github.com/PankratiosV/Beacon/releases/latest/download/Beacon-2.1.0.pkg)** (.pkg installer) · [.dmg](https://github.com/PankratiosV/Beacon/releases/latest/download/Beacon-2.1.0.dmg) |
+| **Windows 10/11** | **[Download Beacon for Windows](https://github.com/PankratiosV/Beacon/releases/latest/download/Beacon-Setup-2.1.1.exe)** (.exe installer) |
+| **Mac** (Apple Silicon or Intel, macOS 12.3+) | **[Download Beacon for Mac](https://github.com/PankratiosV/Beacon/releases/download/v2.1.0/Beacon-2.1.0.pkg)** (.pkg installer) · [.dmg](https://github.com/PankratiosV/Beacon/releases/download/v2.1.0/Beacon-2.1.0.dmg) · version 2.1.0 |
 
 All versions and release notes: **[Releases](https://github.com/PankratiosV/Beacon/releases/latest)**.
 Installation help is under [Install](#install) below.
