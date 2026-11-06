@@ -10,7 +10,7 @@
      the new file names) once a release carries a new .pkg and .dmg. -->
 | | |
 |---|---|
-| **Windows 10/11** | **[Download Beacon for Windows](https://github.com/PankratiosV/Beacon/releases/latest/download/Beacon-Setup-2.1.2.exe)** (.exe installer) |
+| **Windows 10/11** | **[Download Beacon for Windows](https://github.com/PankratiosV/Beacon/releases/latest/download/Beacon-Setup-2.1.3.exe)** (.exe installer) |
 | **Mac** (Apple Silicon or Intel, macOS 12.3+) | **[Download Beacon for Mac](https://github.com/PankratiosV/Beacon/releases/download/v2.1.0/Beacon-2.1.0.pkg)** (.pkg installer) · [.dmg](https://github.com/PankratiosV/Beacon/releases/download/v2.1.0/Beacon-2.1.0.dmg) · version 2.1.0 |
 
 All versions and release notes: **[Releases](https://github.com/PankratiosV/Beacon/releases/latest)**.

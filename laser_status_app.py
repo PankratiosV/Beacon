@@ -85,7 +85,7 @@ from tkinter import filedialog, messagebox, ttk
 # together with MyAppVersion in installer/LaserStatus.iss when you release.
 APP_NAME = "Beacon"
 HEADER_TEXT = "Live Laser Status"   # heading inside the main window (title bar says APP_NAME)
-APP_VERSION = "2.1.2"   # keep in step with installer\LaserStatus.iss
+APP_VERSION = "2.1.3"   # keep in step with installer\LaserStatus.iss
 # v2 has its own identity (name, settings folder, taskbar ID, single-instance
 # port, installer ID) so it runs alongside the original without touching it
 SETTINGS_FOLDER = "LaserStatusV2"
