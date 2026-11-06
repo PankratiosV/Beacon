@@ -2596,9 +2596,16 @@ class RoundPanel(tk.Canvas):
         while len(RoundPanel._cache) > 40:
             RoundPanel._cache.pop(next(iter(RoundPanel._cache)))
         self._img = img
-        self.delete("panel")
-        self.create_image(0, 0, anchor="nw", image=self._img, tags="panel")
-        self.tag_lower("panel")
+        # Swap the picture inside the existing item: deleting it and adding a
+        # new one left a moment with no panel, which a see-through window (the
+        # pill) can show as a flicker while Framing's dashes march
+        item = self.find_withtag("panel")
+        if item and self.type(item[0]) == "image":
+            self.itemconfigure(item[0], image=self._img)
+        else:
+            self.delete("panel")
+            self.create_image(0, 0, anchor="nw", image=self._img, tags="panel")
+            self.tag_lower("panel")
 
     def _draw_shape(self, w, h, r, fill, outline, width, dash, shift=0.0):
         """macOS, see-through window: a see-through canvas there draws shapes
@@ -5496,11 +5503,19 @@ class App:
             self._key_mode = mode
             for win in (self.pill, self.pill_menu):
                 set_window_key(win)
-        outline_key = (self.outline_style(), march, mode)
+        outline = self.outline_style()
+        outline_key = (outline, march, mode)
         if outline_key != getattr(self, "_outline_key", None):
             self._outline_key = outline_key
-            self.card.set_style(*outline_key[0], shift=march)
-            self.pill_frame.set_style(*outline_key[0], shift=march)
+            self.card.set_style(*outline, shift=march)
+        # The pill's dashes stay still on Windows: redrawing its see-through
+        # window 20 times a second made the whole pill flicker. Its outline
+        # changes only with the status.
+        pill_march = 0.0 if IS_WIN else march
+        pill_key = (outline, pill_march, mode)
+        if pill_key != getattr(self, "_pill_outline_key", None):
+            self._pill_outline_key = pill_key
+            self.pill_frame.set_style(*outline, shift=pill_march)
         if self.root.state() != "withdrawn":
             ring = spin if self.state == "framing" else None
             key = (color, on, mode, pulse, ring)
